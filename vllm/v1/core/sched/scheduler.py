@@ -2139,7 +2139,17 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            if self.structured_output_manager.should_advance(request):
+            if request.use_structured_output:
+                if not self.structured_output_manager.should_advance(request):
+                    # Reasoning has not ended, so no grammar bitmask is applied
+                    # yet. A draft accepted in the same step as the reasoning
+                    # marker would extend past it unconstrained, and the FSM
+                    # then rejects those tokens on the next advance (#442).
+                    # Decode one token per step until the marker is seen;
+                    # drafting resumes once the bitmask is active.
+                    if request.spec_token_ids:
+                        request.spec_token_ids = []
+                    continue
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = list(spec_token_ids)
