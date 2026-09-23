@@ -2247,7 +2247,15 @@ class Scheduler(SchedulerInterface):
             # row can still be used for diagnostics or async state repair.
             spec_token_ids = list(spec_token_ids[:orig_num_spec_tokens])
             # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
+            if (
+                request.use_structured_output
+                and not self.structured_output_manager.should_advance(request)
+            ):
+                # Same gate as update_draft_token_ids: while reasoning has not
+                # ended no bitmask is applied, so every pre-scheduled draft
+                # placeholder is marked invalid instead of verified.
+                spec_token_ids = []
+            elif self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 assert metadata is not None and metadata.grammar is not None
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)

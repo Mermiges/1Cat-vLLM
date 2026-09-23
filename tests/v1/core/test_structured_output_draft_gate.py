@@ -65,3 +65,36 @@ def test_plain_request_drafts_are_untouched():
     request.structured_output_request = None
     scheduler.update_draft_token_ids(_drafts())
     assert request.spec_token_ids == [7, 8, 9]
+
+
+def _deferred_output() -> "SchedulerOutput":
+    from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={"0": 4},
+        total_num_scheduled_tokens=4,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={"0": [1, 2, 3]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+
+def test_async_path_marks_all_placeholders_invalid_before_reasoning_ends():
+    scheduler, request = _scheduler_with_request(should_advance=False)
+    output = _deferred_output()
+    scheduler.update_draft_token_ids_in_output(_drafts(), output)
+    assert output.scheduled_spec_decode_tokens["0"] == [-1, -1, -1]
+    assert output.num_invalid_spec_tokens["0"] == 3
+    request.structured_output_request.grammar.validate_tokens.assert_not_called()
+
+
+def test_async_path_validates_drafts_after_reasoning_ends():
+    scheduler, request = _scheduler_with_request(should_advance=True)
+    output = _deferred_output()
+    scheduler.update_draft_token_ids_in_output(_drafts(), output)
+    assert output.scheduled_spec_decode_tokens["0"] == [7, 8, 9]
+    request.structured_output_request.grammar.validate_tokens.assert_called_once()
