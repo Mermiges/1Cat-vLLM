@@ -2139,17 +2139,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            if request.use_structured_output:
-                if not self.structured_output_manager.should_advance(request):
-                    # Reasoning has not ended, so no grammar bitmask is applied
-                    # yet. A draft accepted in the same step as the reasoning
-                    # marker would extend past it unconstrained, and the FSM
-                    # then rejects those tokens on the next advance (#442).
-                    # Decode one token per step until the marker is seen;
-                    # drafting resumes once the bitmask is active.
-                    if request.spec_token_ids:
-                        request.spec_token_ids = []
-                    continue
+            if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = list(spec_token_ids)
@@ -2247,15 +2237,7 @@ class Scheduler(SchedulerInterface):
             # row can still be used for diagnostics or async state repair.
             spec_token_ids = list(spec_token_ids[:orig_num_spec_tokens])
             # Filter out spec tokens which do not adhere to the grammar.
-            if (
-                request.use_structured_output
-                and not self.structured_output_manager.should_advance(request)
-            ):
-                # Same gate as update_draft_token_ids: while reasoning has not
-                # ended no bitmask is applied, so every pre-scheduled draft
-                # placeholder is marked invalid instead of verified.
-                spec_token_ids = []
-            elif self.structured_output_manager.should_advance(request):
+            if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
                 assert metadata is not None and metadata.grammar is not None
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)
