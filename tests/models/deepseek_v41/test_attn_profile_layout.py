@@ -8,14 +8,14 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v41.sm70 import sparse as s70
-from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, SlidingWindowMLASpec
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from .test_attn_kv_specs import _cfg, _v41_specs
 
 
 @pytest.mark.parametrize("bounds", [(0, 14), (14, 28), (28, 40)])
-def test_attn_runner_graph_profile_layout(bounds):
+def test_attn_runner_graph_profile_layout(bounds: tuple[int, int]) -> None:
     """Use the real profiling initializer, allocator and reshape, with CUDA hidden.
 
     Only model construction/attention-group discovery are replaced: real specs,
@@ -42,7 +42,7 @@ def test_attn_runner_graph_profile_layout(bounds):
         get_kv_cache_spec=lambda: specs,
     )
 
-    def initialize(config, *, is_profiling):
+    def initialize(config: KVCacheConfig, *, is_profiling: bool) -> None:
         assert is_profiling
         runner.kv_cache_config = config
         groups = []
