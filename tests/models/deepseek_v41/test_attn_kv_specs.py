@@ -227,3 +227,13 @@ def test_v41_pool_memory_at_256k() -> None:
     mib = [ku._max_memory_usage_bytes_from_groups(cfg, ku._project_kv_cache_groups_to_worker(groups, w)) / 2**20
            for w in workers]
     assert mib == pytest.approx([509.0, 764.0, 626.0], abs=1.0)
+
+
+def test_every_v41_backend_prefers_the_v41_block_size() -> None:
+    """L-INTEG: Platform.update_block_size_for_backend() asks the FIRST cache layer it finds; a compressed or state
+    layer returned the generic default (16) while the specs were built with PREFERRED_BLOCK_SIZE."""
+    from vllm.models.deepseek_v41.sm70.sparse import (PREFERRED_BLOCK_SIZE, DS41CompressedBackend, DS41StateBackend,
+                                                       DS41SWABackend)
+
+    for backend in (DS41SWABackend, DS41CompressedBackend, DS41StateBackend):
+        assert backend.get_preferred_block_size(16) == PREFERRED_BLOCK_SIZE, backend.get_name()
