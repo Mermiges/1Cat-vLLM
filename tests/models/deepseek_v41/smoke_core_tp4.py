@@ -63,7 +63,7 @@ def _worker(rank: int, port: int, shards: list[str], out_dir: str) -> None:
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from tests.models.deepseek_v41 import core_stubs
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
     from vllm.distributed import init_distributed_environment, initialize_model_parallel
     from vllm.models.deepseek_v41.quant_config import DeepseekV41FP8Config
     from vllm.utils.torch_utils import set_default_torch_dtype
@@ -81,6 +81,7 @@ def _worker(rank: int, port: int, shards: list[str], out_dir: str) -> None:
     object.__setattr__(vc, "model_config", mc)
     object.__setattr__(vc, "quant_config", DeepseekV41FP8Config.from_config(dict(hf.quantization_config)))
     vc.scheduler_config.max_num_batched_tokens = 256
+    vc.compilation_config.cudagraph_mode = CUDAGraphMode.NONE       # eager (also what the golden dump needs)
     with set_current_vllm_config(vc):
         init_distributed_environment(world_size=4, rank=rank, local_rank=rank, backend="nccl",
                                      distributed_init_method=f"tcp://127.0.0.1:{port}")

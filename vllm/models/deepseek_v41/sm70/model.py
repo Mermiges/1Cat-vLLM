@@ -21,7 +21,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -37,6 +37,7 @@ from vllm.sequence import IntermediateTensors
 
 from .. import knobs
 from ..common import contracts as C
+from ..common import dump as ds41_dump
 from ..common.contracts import LayerTopology, SharedAttnBuffers, StagePlan, allocate_shared_attn_buffers
 from ..common.hc import hc_collapse, hc_expand, hc_mixes, hc_post, hc_pre, rmsnorm_to_act
 from ..common.topology import N_BACKBONE_LAYERS, layer_topology, make_stage_plan
@@ -159,14 +160,36 @@ class DeepseekV41DecoderLayer(nn.Module):
     def forward(self, stream: torch.Tensor, pre_in: torch.Tensor, positions: torch.Tensor
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         # stream [T,4,5120] bf16, pre_in [T,4] f32, positions [T] int64  ->  (stream' bf16, ffn_pre f32)
+        dumping = ds41_dump.ENABLED
+        layer = self.layer_id
+        if dumping:
+            ds41_dump.dump(layer, "stream_in", stream)
+            ds41_dump.dump(layer, "pre_in", pre_in)
         if self.engram is not None:
             stream = self.engram(stream, positions)                    # before the block's mixes (ref:m.py:1262)
+            if dumping:
+                ds41_dump.dump(layer, "engram.out", stream)
         attn_pre, attn_post, attn_comb = hc_mixes(stream, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        x = rmsnorm_to_act(hc_pre(stream, pre_in), self.attn_norm.weight)          # uses the PREVIOUS pre
-        stream = hc_post(self.attn(positions, x), stream, attn_post, attn_comb)
+        collapsed = hc_pre(stream, pre_in)                                          # uses the PREVIOUS pre
+        x = rmsnorm_to_act(collapsed, self.attn_norm.weight)
+        attn_out = self.attn(positions, x)
+        if dumping:
+            for name, t in (("hc.attn_pre", attn_pre), ("hc.attn_post", attn_post), ("hc.attn_comb", attn_comb),
+                            ("hc.attn_x", collapsed), ("attn.x", x), ("attn.out", attn_out)):
+                ds41_dump.dump(layer, name, t)
+        stream = hc_post(attn_out, stream, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = hc_mixes(stream, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        x = rmsnorm_to_act(hc_pre(stream, attn_pre), self.ffn_norm.weight)         # uses this block's attn pre
-        stream = hc_post(self.ffn(x), stream, ffn_post, ffn_comb)
+        collapsed = hc_pre(stream, attn_pre)                                        # uses this block's attn pre
+        x = rmsnorm_to_act(collapsed, self.ffn_norm.weight)
+        if dumping:
+            for name, t in (("stream_attn", stream), ("hc.ffn_pre", ffn_pre), ("hc.ffn_post", ffn_post),
+                            ("hc.ffn_comb", ffn_comb), ("hc.ffn_x", collapsed), ("moe.x", x)):
+                ds41_dump.dump(layer, name, t)
+        moe_out = self.ffn(x)
+        stream = hc_post(moe_out, stream, ffn_post, ffn_comb)
+        if dumping:
+            for name, t in (("moe.out", moe_out), ("stream_out", stream), ("pre_out", ffn_pre)):
+                ds41_dump.dump(layer, name, t)
         return stream, ffn_pre
 
 
@@ -183,6 +206,8 @@ class DeepseekV41Model(nn.Module):
             # Engram keys on (PORT_DESIGN §9 AM-2), and the Engram step binding assumes one forward per step.
             raise NotImplementedError("DeepSeek-V4.1 does not support DBO / micro-batching (--enable-dbo, "
                                       "ubatch_size > 1)")
+        if ds41_dump.ENABLED and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(f"{ds41_dump.DIR_KNOB} (golden dump) needs eager execution: launch with --enforce-eager")
         # §4.1 MUST: FP16 GEMMs accumulate in FP32 without reduced-precision split-K reductions
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
         self.config = config
@@ -285,6 +310,8 @@ class DeepseekV41Model(nn.Module):
     def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
                 intermediate_tensors: IntermediateTensors | None,
                 inputs_embeds: torch.Tensor | None = None) -> torch.Tensor | IntermediateTensors:
+        if ds41_dump.ENABLED:
+            ds41_dump.begin_step(positions, positions.shape[0])
         if self.pp_is_first:
             embedded = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
             stream, pre = hc_expand(embedded)
@@ -308,8 +335,17 @@ class DeepseekV41Model(nn.Module):
                 out[C.PP_KEY_KV20_CKV] = self.shared.export_ckv[:num_tokens]
                 out[C.PP_KEY_KV20_IK] = self.shared.export_ik[:num_tokens]
                 out[C.PP_KEY_CAND20] = self.shared.candidate_blocks[:num_tokens]
+            if ds41_dump.ENABLED:
+                ds41_dump.end_forward()
             return IntermediateTensors(out)
-        return hc_collapse(stream, pre, self.norm.weight)
+        if not ds41_dump.ENABLED:
+            return hc_collapse(stream, pre, self.norm.weight)
+        collapsed = hc_pre(stream, pre)
+        hidden = rmsnorm_to_act(collapsed, self.norm.weight)
+        for name, t in (("final.stream_in", stream), ("final.hc", collapsed), ("final.h", hidden)):
+            ds41_dump.dump(None, name, t)
+        ds41_dump.end_forward()
+        return hidden
 
 
 # ---------------------------------------------------------------- checkpoint names (§3.7)
@@ -389,7 +425,11 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
             local = torch.mm(hidden_states.float(), weight.float().t())
         if get_tensor_model_parallel_world_size() > 1:
             local = tensor_model_parallel_all_gather(local, dim=-1)
-        return local[:, : self.config.vocab_size]
+        logits = local[:, : self.config.vocab_size]
+        if ds41_dump.ENABLED:
+            ds41_dump.dump(None, "logits", logits)
+            ds41_dump.end_logits()
+        return logits
 
     # ---- loading ----
     def skip_checkpoint_weight(self, name: str) -> bool:
