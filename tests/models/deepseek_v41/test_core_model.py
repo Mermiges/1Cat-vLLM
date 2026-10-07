@@ -99,8 +99,15 @@ def _build(ckpt: Path, monkeypatch: pytest.MonkeyPatch, subset: str = "0,1,2,3")
     from vllm.models.deepseek_v41.sm70.model import DeepseekV41ForCausalLM
 
     vc = _vllm_config(ckpt)
-    with set_current_vllm_config(vc), set_default_torch_dtype(torch.float16):
-        model = DeepseekV41ForCausalLM(vllm_config=vc)
+    # vLLM's set_default_torch_dtype restores the dtype only on a clean exit (no try/finally): a constructor that
+    # raises (e.g. the open-subset rejection test) would leave float16 as the process default and break later
+    # tests' float32 tensors (L-INTEG: 21 test_moe_* reds in the combined suite). Restore it unconditionally.
+    prev_dtype = torch.get_default_dtype()
+    try:
+        with set_current_vllm_config(vc), set_default_torch_dtype(torch.float16):
+            model = DeepseekV41ForCausalLM(vllm_config=vc)
+    finally:
+        torch.set_default_dtype(prev_dtype)
     return model, vc
 
 
