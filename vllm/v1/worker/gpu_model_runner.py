@@ -6553,13 +6553,17 @@ class GPUModelRunner(
         return service
 
     def _refuse_full_cudagraphs_with_engram(self) -> None:
-        """PORT_DESIGN §9 AM-11c: a stage with Engram layers runs breakable graphs only.
+        """AM-11c / D21: Engram host waits must remain outside stream capture.
         Checked after the cudagraph mode is resolved (attention builders may have
         downgraded a requested FULL mode)."""
         if self._engram_bind_service() is None:
             return
         mode = self.compilation_config.cudagraph_mode
         if mode is not None and mode.has_full_cudagraphs():
+            from vllm.compilation.breakable_cudagraph import ds41_forced_eager_breaks
+
+            if ds41_forced_eager_breaks(self.vllm_config):
+                return
             raise ValueError(
                 f"cudagraph_mode={mode.name} captures FULL CUDA graphs, but this "
                 "DeepSeek-V4.1 stage owns Engram layers (host row gathers are eager "

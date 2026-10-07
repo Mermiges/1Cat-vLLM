@@ -56,6 +56,22 @@ def is_breakable_cudagraph_enabled() -> bool:
 
 F = TypeVar("F", bound=Callable[..., Any])
 
+DS41_ENGRAM_WAIT = "vllm.models.deepseek_v41.common.engram._wait_rows_eager"
+DS41_MIRROR_INGEST = "vllm.models.deepseek_v41.kv_mirror.ds41_mirror_ingest"
+
+
+def ds41_forced_eager_breaks(vllm_config: VllmConfig) -> frozenset[str]:
+    """D21: FULL decode still breaks at the host-only Engram row wait."""
+    model_config = vllm_config.model_config
+    if (
+        is_breakable_cudagraph_enabled()
+        and model_config is not None
+        and "DeepseekV41ForCausalLM" in model_config.architectures
+        and not vllm_config.parallel_config.use_ubatching
+    ):
+        return frozenset({DS41_ENGRAM_WAIT, DS41_MIRROR_INGEST})
+    return frozenset()
+
 
 def eager_break_during_capture(fn: F) -> F:
     """Decorator that turns a custom-op Python kernel into a "break point"
@@ -88,8 +104,18 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    # Model config can enable graphs after the decorated module is imported.
-    # An inactive capture always passes through below.
+    return _decorate_eager_break(fn, force=False)
+
+
+def forced_eager_break_during_capture(fn: F) -> F:
+    """An in-place eager break even in FULL runtime mode (host-only work)."""
+    return _decorate_eager_break(fn, force=True)
+
+
+def _decorate_eager_break(fn: F, *, force: bool) -> F:
+    # Wrap at import time even if graphs are enabled later by model config.
+    # With no active capture the wrapper is always a simple pass-through.
+    name = f"{fn.__module__}.{fn.__qualname__}"
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -100,7 +126,11 @@ def eager_break_during_capture(fn: F) -> F:
             return fn(*args, **kwargs)
         if is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
-            if mode == CUDAGraphMode.FULL:
+            if (
+                mode == CUDAGraphMode.FULL
+                and not force
+                and name not in capture.forced_eager_breaks
+            ):
                 return fn(*args, **kwargs)
 
         # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool
@@ -148,8 +178,13 @@ class BreakableCUDAGraphCapture:
     def is_active(cls) -> bool:
         return cls.current() is not None
 
-    def __init__(self, pool: Any | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any | None = None,
+        forced_eager_breaks: frozenset[str] = frozenset(),
+    ) -> None:
         self.pool = pool
+        self.forced_eager_breaks = forced_eager_breaks
         self.segments: list[Callable[[], Any]] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
@@ -379,7 +414,10 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
+        capture = BreakableCUDAGraphCapture(
+            pool=self.graph_pool,
+            forced_eager_breaks=ds41_forced_eager_breaks(self.vllm_config),
+        )
         with capture:
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last
