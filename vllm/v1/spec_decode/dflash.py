@@ -939,6 +939,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             batch_descriptor=batch_descriptor,
             slot_mapping=slot_mapping_dict,
+            is_dummy_run=True,
         ):
             self.model(
                 input_ids=self.input_ids[:num_input_tokens],
