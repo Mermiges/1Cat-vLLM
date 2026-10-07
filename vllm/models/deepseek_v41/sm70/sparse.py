@@ -351,6 +351,12 @@ class _DS41BackendBase(AttentionBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         return list(cls.HEAD_SIZES)
 
+    @classmethod
+    def get_preferred_block_size(cls, default_block_size: int) -> int:
+        # every V4.1 cache backend: Platform.update_block_size_for_backend() asks whichever V4.1 cache layer it
+        # finds first (SWA, compressed or state), and the specs were built with this size at model init
+        return PREFERRED_BLOCK_SIZE
+
 
 class DS41SWABackend(_DS41BackendBase):
     HEAD_SIZES = (SWA_RECORD_DIM,)
@@ -362,10 +368,6 @@ class DS41SWABackend(_DS41BackendBase):
     @staticmethod
     def get_builder_cls() -> type[DS41SWAMetadataBuilder]:
         return DS41SWAMetadataBuilder
-
-    @classmethod
-    def get_preferred_block_size(cls, default_block_size: int) -> int:
-        return PREFERRED_BLOCK_SIZE
 
 
 class DS41CompressedBackend(_DS41BackendBase):
