@@ -122,6 +122,8 @@ def _finish_loading(model, vc) -> None:
 
 @pytest.fixture
 def loaded_model(ds41_dist_single, ds41_checkpoint_dir, monkeypatch):
+    # Synthetic weights stay on CPU; g32 packing requires CUDA tensors.
+    monkeypatch.setenv("VLLM_DS41_MOE_DENSE_G32", "0")
     model, vc = _build(ds41_checkpoint_dir, monkeypatch)
     loaded = model.load_weights(_weights_for({0, 1, 2, 3}))
     _finish_loading(model, vc)
