@@ -25,6 +25,7 @@ stage vs 928 / 1161 / 571 MiB with 64-token SWA and 8-token state blocks.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -201,11 +202,10 @@ DECODE_PATH_ENV = "VLLM_DS41_ATTN_DECODE_PATH"
 
 
 def decode_path_enabled() -> bool:
-    """Decode batches get builder-owned, graph-safe metadata (``decode=True``). OFF by default until the layers'
-    static-shape decode path consumes it (the general-path layers cannot); the torch oracle impl never uses it."""
+    """SM70 decode uses graph-safe metadata by default; the torch oracle uses general metadata."""
     if knobs.env_str("VLLM_DS41_ATTN_IMPL", "sm70", choices=("sm70", "torch")) == "torch":
         return False
-    return knobs.env_bool(DECODE_PATH_ENV, False)
+    return knobs.env_bool(DECODE_PATH_ENV, True)
 
 
 def _exact_seq_lens_cpu(cm: CommonAttentionMetadata) -> np.ndarray:
@@ -233,8 +233,7 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
     # P5-ATTN: uniform single-token decode batches get builder-owned, fixed-address metadata (decode=True) and the
     # layers' static-shape decode path, which FULL CUDA graphs capture; prefill / mixed batches keep the general
     # (host-dependent) path, which runs eagerly (breakable graphs: an eager break; PIECEWISE runtime mode).
-    # Until the layers' decode path lands (P5-ATTN handoff) the decode metadata is OFF by default
-    # (VLLM_DS41_ATTN_DECODE_PATH=0): the builders then declare NEVER and emit general metadata only.
+    # Explicit VLLM_DS41_ATTN_DECODE_PATH=0 disables decode metadata and graph support.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
     uses_physical_block_table: ClassVar[bool] = True
     DECODE_KIND: ClassVar[int] = KIND_SWA
@@ -251,6 +250,16 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
         _require_exact_host_lengths(vllm_config)
         self._init_reorder_batch_threshold(1)
         self._decode_buffers: DecodeBuffers | None = None
+        ctx = vllm_config.compilation_config.static_forward_context
+        self._mirror_checks: list[Callable[[], None]] = []
+        for name in layer_names:
+            check = getattr(ctx.get(name), "check_pending_mirror_errors", None)
+            if check is not None:
+                self._mirror_checks.append(check)
+
+    def _check_mirrors(self) -> None:
+        for check in self._mirror_checks:
+            check()
 
     def _decode_bufs(self) -> DecodeBuffers:
         if self._decode_buffers is None:
@@ -279,6 +288,7 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
     def _decode_common(self, cm: CommonAttentionMetadata, t_real: int, storage: int, ratio: int
                        ) -> tuple[dict, DecodeBuffers]:
         """Fill the builder-owned buffers on the device and return the base fields (views of them)."""
+        self._check_mirrors()
         self._check_block_geometry()
         T = int(cm.num_actual_tokens)
         bufs = self._decode_bufs()
@@ -303,6 +313,7 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
                 f"{self.kv_cache_spec.block_size}; the V4.1 builders index physical blocks")
 
     def _common(self, cm: CommonAttentionMetadata) -> dict:
+        self._check_mirrors()
         self._check_block_geometry()
         T = int(cm.num_actual_tokens)
         R = int(cm.num_reqs)

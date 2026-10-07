@@ -51,6 +51,7 @@ from vllm.models.deepseek_v41.sm70.sparse import (
     index_k_cache_spec,
     step_metadata,
 )
+from vllm.triton_utils import tl, triton
 
 MIRROR_CHECK_ENV = "VLLM_DS41_ATTN_MIRROR_CHECK"
 # PP payload key of the debug CRC (PORT_DESIGN §3.5 item 4). Not in the frozen contracts.py (CORE-owned): L-CORE
@@ -86,6 +87,53 @@ def kv20_crc(ckv: torch.Tensor, ik: torch.Tensor) -> torch.Tensor:
             + ik.view(torch.int16).sum(dim=-1, dtype=torch.int32))
 
 
+@triton.jit
+def _mirror_scatter(src, src_st0, src_st1, rows, slots, D: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    j = tl.arange(0, D)
+    slot = tl.load(slots + t)
+    value = tl.load(src + t * src_st0 + j * src_st1)
+    tl.store(rows + slot * D + j, value, mask=slot >= 0)
+
+
+@triton.jit
+def _mirror_crc(
+    ckv,
+    cs0,
+    cs1,
+    ik,
+    is0,
+    is1,
+    crows,
+    irows,
+    cslots,
+    islots,
+    crc,
+    errors,
+    DC: tl.constexpr,
+    DI: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    c = tl.arange(0, DC)
+    i = tl.arange(0, DI)
+    sent = tl.load(crc + t)
+    payload = tl.sum(
+        tl.load(ckv + t * cs0 + c * cs1).to(tl.int16, bitcast=True).to(tl.int32), 0
+    ) + tl.sum(
+        tl.load(ik + t * is0 + i * is1).to(tl.int16, bitcast=True).to(tl.int32), 0
+    )
+    cs = tl.load(cslots + t)
+    ins = tl.load(islots + t)
+    keep = (cs >= 0) & (ins >= 0)
+    cv = tl.load(crows + tl.maximum(cs, 0) * DC + c, mask=keep, other=0)
+    iv = tl.load(irows + tl.maximum(ins, 0) * DI + i, mask=keep, other=0)
+    placed = tl.sum(cv.to(tl.int16, bitcast=True).to(tl.int32), 0) + tl.sum(
+        iv.to(tl.int16, bitcast=True).to(tl.int32), 0
+    )
+    bad = (payload != sent) | ((cs >= 0) != (ins >= 0)) | (keep & (placed != sent))
+    tl.atomic_add(errors, bad.to(tl.int32), sem="relaxed")
+
+
 class DeepseekV41KVSourceMirror(nn.Module):
     def __init__(self, vllm_config: VllmConfig, source_layer: int, shared: SharedAttnBuffers, *,
                  layers_prefix: str | None = None) -> None:
@@ -112,10 +160,27 @@ class DeepseekV41KVSourceMirror(nn.Module):
         self.ik_cache = DS41CacheLayer(ik_name, index_k_cache_spec(block_size, ratio), DS41CompressedBackend,
                                        vllm_config)
         self.check = knobs.env_bool(MIRROR_CHECK_ENV, False)
+        self.register_buffer(
+            "crc_errors", torch.zeros((), dtype=torch.int32), persistent=False
+        )
+        # Only the compressed mirror builder checks it; index-K often shares its group.
+        self.ckv_cache.__dict__["check_pending_mirror_errors"] = (
+            self.check_pending_errors
+        )
         self.layer_name = f"{ckv_name}.ds41_mirror"
         if self.layer_name in ctx:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
         ctx[self.layer_name] = self
+
+    def check_pending_errors(self) -> None:
+        """Report replay CRC errors at the next host metadata boundary."""
+        if self.check:
+            bad = int(self.crc_errors.item())
+            if bad:
+                raise RuntimeError(
+                    f"KV mirror: {bad} CRC/slot errors "
+                    "from preceding decode ingest/replay"
+                )
 
     def ingest(self, positions: torch.Tensor, ckv: torch.Tensor, ik: torch.Tensor, cand: torch.Tensor,
                crc: torch.Tensor | None = None) -> None:
@@ -140,39 +205,111 @@ class DeepseekV41KVSourceMirror(nn.Module):
                                f"stage must send kv20_crc(export_ckv[:T], export_ik[:T])")
         ds41_mirror_ingest(positions, ckv, ik, cand, crc, self.layer_name)
 
-    def ingest_impl(self, positions: torch.Tensor, ckv: torch.Tensor, ik: torch.Tensor, cand: torch.Tensor,
-                    crc: torch.Tensor | None) -> None:
+    def ingest_impl(
+        self,
+        positions: torch.Tensor,
+        ckv: torch.Tensor,
+        ik: torch.Tensor,
+        cand: torch.Tensor,
+        crc: torch.Tensor | None,
+    ) -> None:
         md_all = step_metadata(self.layer_name)
-        if md_all is None:              # dummy/profile forward without metadata: nothing to replicate
+        if (
+            md_all is None
+        ):  # dummy/profile forward without metadata: nothing to replicate
             return
         m_ckv = cast(DS41CompressedMetadata, md_all[self.ckv_cache.layer_name])
         m_ik = cast(DS41CompressedMetadata, md_all[self.ik_cache.layer_name])
         n = m_ckv.num_latents
         if m_ik.num_latents != n or m_ckv.compress_ratio != 1:
-            raise RuntimeError(f"mirror metadata mismatch: ckv {n} latents (ratio {m_ckv.compress_ratio}), "
-                               f"ik {m_ik.num_latents}")
+            raise RuntimeError(
+                f"mirror metadata mismatch: ckv {n} latents (ratio {m_ckv.compress_ratio}), "
+                f"ik {m_ik.num_latents}"
+            )
         if n > ckv.shape[0]:
-            raise RuntimeError(f"mirror metadata has {n} latents for a payload of {ckv.shape[0]} rows")
+            raise RuntimeError(
+                f"mirror metadata has {n} latents for a payload of {ckv.shape[0]} rows"
+            )
         ckv_rows, ik_rows = self.ckv_cache.rows(), self.ik_cache.rows()
-        for rows, src, slots in ((ckv_rows, ckv, m_ckv.latent_slots), (ik_rows, ik, m_ik.latent_slots)):
+        if m_ckv.decode:
+            if not m_ik.decode:
+                raise RuntimeError(
+                    "KV mirror: compressed and index-K decode modes disagree"
+                )
+            _mirror_scatter[(n,)](
+                ckv,
+                ckv.stride(0),
+                ckv.stride(1),
+                ckv_rows,
+                m_ckv.latent_slots,
+                D=CKV_RECORD_DIM,
+                num_warps=4,
+            )
+            _mirror_scatter[(n,)](
+                ik,
+                ik.stride(0),
+                ik.stride(1),
+                ik_rows,
+                m_ik.latent_slots,
+                D=IK_RECORD_DIM,
+                num_warps=4,
+            )
+            self.shared.candidate_blocks[:n].copy_(cand[:n])
+            if self.check:
+                if crc is None:
+                    raise RuntimeError(
+                        f"{MIRROR_CHECK_ENV}=1 but no {PP_KEY_KV20_CRC} reached ingest_impl"
+                    )
+                _mirror_crc[(n,)](
+                    ckv,
+                    ckv.stride(0),
+                    ckv.stride(1),
+                    ik,
+                    ik.stride(0),
+                    ik.stride(1),
+                    ckv_rows,
+                    ik_rows,
+                    m_ckv.latent_slots,
+                    m_ik.latent_slots,
+                    crc,
+                    self.crc_errors,
+                    DC=CKV_RECORD_DIM,
+                    DI=IK_RECORD_DIM,
+                    num_warps=4,
+                )
+            return
+        for rows, src, slots in (
+            (ckv_rows, ckv, m_ckv.latent_slots),
+            (ik_rows, ik, m_ik.latent_slots),
+        ):
             keep = slots >= 0
             rows.index_copy_(0, slots[keep], src[:n][keep])
         self.shared.candidate_blocks[:n].copy_(cand[:n])
         if self.check:
             if crc is None:
-                raise RuntimeError(f"{MIRROR_CHECK_ENV}=1 but no {PP_KEY_KV20_CRC} reached ingest_impl")
+                raise RuntimeError(
+                    f"{MIRROR_CHECK_ENV}=1 but no {PP_KEY_KV20_CRC} reached ingest_impl"
+                )
             sent = crc[:n]
             if not torch.equal(kv20_crc(ckv[:n], ik[:n]), sent):
                 bad = int((kv20_crc(ckv[:n], ik[:n]) != sent).sum())
-                raise RuntimeError(f"KV mirror: {bad}/{n} payload rows do not match the exporter's {PP_KEY_KV20_CRC}")
+                raise RuntimeError(
+                    f"KV mirror: {bad}/{n} payload rows do not match the exporter's {PP_KEY_KV20_CRC}"
+                )
             keep = (m_ckv.latent_slots >= 0) & (m_ik.latent_slots >= 0)
             if not torch.equal(m_ckv.latent_slots >= 0, m_ik.latent_slots >= 0):
-                raise RuntimeError("KV mirror: ckv and ik slot mappings disagree on which tokens are written")
-            got = kv20_crc(ckv_rows.index_select(0, m_ckv.latent_slots[keep]),
-                           ik_rows.index_select(0, m_ik.latent_slots[keep]))
+                raise RuntimeError(
+                    "KV mirror: ckv and ik slot mappings disagree on which tokens are written"
+                )
+            got = kv20_crc(
+                ckv_rows.index_select(0, m_ckv.latent_slots[keep]),
+                ik_rows.index_select(0, m_ik.latent_slots[keep]),
+            )
             if not torch.equal(got, sent[keep]):
-                raise RuntimeError(f"KV mirror: {int((got != sent[keep]).sum())} written rows differ from the "
-                                   f"exporter's {PP_KEY_KV20_CRC} after ingest")
+                raise RuntimeError(
+                    f"KV mirror: {int((got != sent[keep]).sum())} written rows differ from the "
+                    f"exporter's {PP_KEY_KV20_CRC} after ingest"
+                )
 
 
 @eager_break_during_capture
