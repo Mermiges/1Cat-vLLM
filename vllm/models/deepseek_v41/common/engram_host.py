@@ -185,8 +185,10 @@ class _PinnedHostBuffer:
 
     def release(self) -> None:
         if self._registered:
-            torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr())
+            rc = torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr())
             self._registered = False
+            if int(rc) != 0:
+                raise RuntimeError(f"cudaHostUnregister of the Engram scale table failed: {rc}")
 
 
 def _pread_into(fd: int, dst: np.ndarray, offset: int, path: str) -> None:
@@ -450,13 +452,15 @@ class EngramHostService:
                     raise ValueError(f"Engram: request {r.req_id} token_ids {ids.shape} != num_tokens {n}")
                 hist.write(start, self.hasher.compress(ids))
                 resolved = True
-            elif start + n <= hist.length:
-                resolved = True                     # continuation of a known prompt (chunked prefill)
-            elif n == 1 and start == hist.length:
-                resolved = False                    # sampled token arrives in bind_batch (async PP / no PP)
+            elif start + n <= hist.prompt_len:
+                resolved = True                     # continuation of the known prompt (chunked prefill)
+            elif n == 1 and hist.prompt_len <= start <= hist.length:
+                resolved = False                    # sampled token arrives in bind_batch (no PP); positions past
+                                                    # start (rejected drafts) are dropped when it is written
             else:
-                raise ValueError(f"Engram: request {r.req_id} positions [{start}, {start + n}) unknown "
-                                 f"(history {hist.length}) and not a single sampled token")
+                raise ValueError(f"Engram: request {r.req_id} positions [{start}, {start + n}) without token ids: "
+                                 f"only prompt positions (< {hist.prompt_len}) or one sampled token at <= "
+                                 f"{hist.length} can be resolved")
             if resolved:
                 known_rows.append(self.hasher.hash_positions(hist.view(), np.arange(start, start + n)))
                 known_meta.append((off, n))
@@ -471,16 +475,17 @@ class EngramHostService:
         if known_rows:
             rows = np.concatenate(known_rows, axis=0)
             kinv, n_u, ticket = self._submit_rows(rows, slot, 1)
+            step.tickets.append(ticket)
+            self._step = step          # published at once: a later exception still leaves the gather owned/drained
             pos = 0
             for t_off, n in known_meta:
                 inv[t_off:t_off + n] = kinv[pos:pos + n]
                 pos += n
             step.n_unique = n_u
-            step.tickets.append(ticket)
-        for rows in prefetch:
-            self._prefetch_rows(rows)
         self._step = step
         self._stats["steps"] += 1
+        for rows in prefetch:
+            self._prefetch_rows(rows)
 
     def bind_batch(self, layout: EngramBatchLayout) -> None:
         """Runner thread, after _prepare_inputs and before the forward of a REAL scheduled step. Dummy forwards
@@ -530,7 +535,10 @@ class EngramHostService:
                                "tokens but the runner passed no sampled_fill")
         ids_t, event = layout.sampled_fill
         event.synchronize()
-        ids = ids_t.numpy()
+        ids = ids_t.reshape(-1).numpy()
+        if ids.shape[0] != len(layout.req_order):
+            raise ValueError(f"Engram step {step.step_id}: sampled_fill holds {ids.shape[0]} ids, expected one per "
+                             f"request in runner order ({len(layout.req_order)})")
         rows, blocks = [], []
         for i, rid in unresolved:
             rs = step.reqs[rid]
@@ -632,8 +640,10 @@ class EngramHostService:
             self._reader.drop_cache(i)
 
     def shutdown(self) -> None:
+        """Joins the reader's threads BEFORE the staging/scale memory they write into or read from is released."""
         if getattr(self, "_reader", None) is not None:
             self._reader.shutdown()
             self._reader = None
         for b in getattr(self, "_scales", []):
             b.release()
+        self._scales = []

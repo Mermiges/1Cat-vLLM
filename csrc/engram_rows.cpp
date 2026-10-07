@@ -64,10 +64,10 @@ struct Job {
   int64_t row_bytes = 0;
   int64_t extra_bytes = 0;
   int64_t dst_stride = 0;
-  // Index inputs are copied (never a numpy-backed tensor held by a worker thread); dst is kept alive by ref.
+  // Index inputs are copied and dst is a raw pointer: a worker thread never owns a Python-visible tensor (whose
+  // release could need the GIL). The caller (EngramHostService) owns dst and joins the pool (shutdown) first.
   std::vector<int32_t> file_v, xtab_v;
   std::vector<int64_t> off_v, xidx_v;
-  torch::Tensor dst_t;
   const int32_t* file_idx = nullptr;
   const int64_t* offsets = nullptr;
   const int32_t* xtab = nullptr;
@@ -125,16 +125,29 @@ class RowReader {
   ~RowReader() { shutdown(); }
 
   void shutdown() {
+    std::vector<std::shared_ptr<Job>> pending;
     {
       std::lock_guard<std::mutex> g(mu_);
       if (stop_) return;
       stop_ = true;
+      for (auto& kv : jobs_) pending.push_back(kv.second);
     }
     cv_.notify_all();
     for (auto& t : threads_) {
       if (t.joinable()) t.join();
     }
     threads_.clear();
+    for (auto& job : pending) {  // unfinished jobs fail loudly instead of leaving a wait() hanging
+      std::lock_guard<std::mutex> g(job->done_mu);
+      if (!job->done) {
+        {
+          std::lock_guard<std::mutex> e(job->err_mu);
+          if (job->error.empty()) job->error = "Engram RowReader shut down before the job finished";
+        }
+        job->done = true;
+      }
+      job->done_cv.notify_all();
+    }
     for (int fd : fds_) ::close(fd);
     fds_.clear();
   }
@@ -193,7 +206,6 @@ class RowReader {
     job->off_v.assign(offsets.data_ptr<int64_t>(), offsets.data_ptr<int64_t>() + n);
     job->xtab_v.assign(xt, xt + n);
     job->xidx_v.assign(xi, xi + n);
-    job->dst_t = dst;
     job->file_idx = job->file_v.data();
     job->offsets = job->off_v.data();
     job->xtab = job->xtab_v.data();
@@ -322,7 +334,7 @@ class RowReader {
     miss.reserve(kPrefetchChunk);
     void* bounce = nullptr;
     if (o_direct_) {
-      TORCH_CHECK(::posix_memalign(&bounce, kDirectAlign, 2 * kDirectAlign + 1024) == 0,
+      TORCH_CHECK(::posix_memalign(&bounce, kDirectAlign, 2 * kDirectAlign) == 0,
                   "Engram RowReader: posix_memalign failed");
     }
     std::vector<std::shared_ptr<Job>> grave;
@@ -436,14 +448,16 @@ class RowReader {
   }
 
   void do_direct(Job& job, int64_t start, int64_t end, uint8_t* bounce) {
+    // 4 KiB alignment is valid for 512 B and 4 KiB logical-block devices alike (measurement mode only).
     int64_t pages = 0;
     for (int64_t i = start; i < end; ++i) {
       const int64_t off = job.offsets[i];
-      const int64_t a = off / 512 * 512;
-      const int64_t b = (off + job.row_bytes + 511) / 512 * 512;
+      const int64_t a = off / kDirectAlign * kDirectAlign;
+      const int64_t b = (off + job.row_bytes + kDirectAlign - 1) / kDirectAlign * kDirectAlign;
+      const int64_t need = off + job.row_bytes - a;   // a row at the end of the file: the read may stop at EOF
       TORCH_CHECK(b - a <= 2 * kDirectAlign, "Engram RowReader: O_DIRECT span too large");
       int64_t got = 0;
-      while (got < b - a) {
+      while (got < need) {
         ssize_t r = ::pread(fds_[job.file_idx[i]], bounce + got, b - a - got, a + got);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) io_fail(job, i, "pread(O_DIRECT)", r, r < 0 ? errno : EIO);
@@ -463,8 +477,11 @@ class RowReader {
       const int64_t off = job.offsets[i];
       const int64_t a = off / kPage * kPage;
       const int64_t b = (off + job.row_bytes + kPage - 1) / kPage * kPage;
-      ::posix_fadvise(fds_[job.file_idx[i]], a, b - a, POSIX_FADV_WILLNEED);
-      pages += (b - a) / kPage;
+      if (::posix_fadvise(fds_[job.file_idx[i]], a, b - a, POSIX_FADV_WILLNEED) == 0) {
+        pages += (b - a) / kPage;   // only advice the kernel accepted counts as warm-up
+      } else {
+        job.misses.fetch_add(1);    // reported as failed prefetch rows (stats only; the step gather is authoritative)
+      }
     }
     job.pages.fetch_add(pages);
   }

@@ -165,9 +165,45 @@ def test_async_fill_rollback_resume_finish(syn: SyntheticEngram) -> None:
             svc.begin_step(EngramStepPlan(15, (EngramReqStep("R", 44, 1, np.array([5], np.int32), None),),
                                           frozenset({"R"})))
         # a gap in the history is refused
-        with pytest.raises(ValueError, match="unknown"):
+        with pytest.raises(ValueError, match="without token ids"):
             svc.begin_step(EngramStepPlan(16, (EngramReqStep("S", 5, 2, None, np.arange(3, 6, dtype=np.int32)),),
                                           frozenset()))
+    finally:
+        svc.shutdown()
+
+
+def test_sampled_fill_shape_and_draft_rollback(syn: SyntheticEngram) -> None:
+    """sampled_fill must carry one id per request in runner order; a sampled token written after rejected drafts
+    replaces them (no stale draft is ever hashed as a known token)."""
+    svc = make_service(syn, tp_rank=1, layers=(1,))
+    try:
+        orc = Oracle(svc, syn)
+        p = np.random.default_rng(6).integers(3, 129000, size=20)
+        q = np.random.default_rng(7).integers(3, 129000, size=12)
+        orc.set("A", 0, p)
+        orc.set("B", 0, q)
+        run_step(svc, 0, [EngramReqStep("A", 0, 20, p.astype(np.int32), p.astype(np.int32)),
+                          EngramReqStep("B", 0, 12, q.astype(np.int32), q.astype(np.int32))], ["A", "B"], 32)
+        drafts = np.array([7, 8, 9], np.int32)            # spec step: 1 sampled + 2 drafts for A
+        orc.set("A", 20, drafts)
+        run_step(svc, 1, [EngramReqStep("A", 20, 3, drafts, None)], ["A"], 3)
+        # next step: only the first draft was accepted; the token at 21 comes from the sampler (unknown at begin)
+        ev = torch.cuda.Event()
+        ev.record()
+        bad = (torch.tensor([555], dtype=torch.int32).pin_memory(), ev)
+        svc.begin_step(EngramStepPlan(2, (EngramReqStep("A", 21, 1, None, None),
+                                          EngramReqStep("B", 12, 1, None, None)), frozenset()))
+        with pytest.raises(ValueError, match="one per"):
+            svc.bind_batch(EngramBatchLayout(2, ("B", "A"), np.array([0, 1, 2], np.int32), 2, 2, bad))
+        fill = (torch.tensor([[31], [555]], dtype=torch.int32).pin_memory(), ev)    # [num_reqs, 1] like recv
+        orc.set("B", 12, [31])
+        orc.set("A", 21, [555])
+        got = run_step(svc, 3, [EngramReqStep("A", 21, 1, None, None), EngramReqStep("B", 12, 1, None, None)],
+                       ["B", "A"], 2, sampled_fill=fill)
+        expect(orc, got, [("B", 12, 1), ("A", 21, 1)], 2)
+        # without ids, a position past the prompt cannot be treated as known (drafts may have been rejected)
+        with pytest.raises(ValueError, match="only prompt positions"):
+            svc.begin_step(EngramStepPlan(4, (EngramReqStep("A", 20, 2, None, None),), frozenset()))
     finally:
         svc.shutdown()
 

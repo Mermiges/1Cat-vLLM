@@ -185,6 +185,46 @@ def test_module_tp4_row_parallel_matches_tp1(syn: SyntheticEngram, monkeypatch: 
             svc.shutdown()
 
 
+def test_tp4_ranks_with_different_row_biases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rank 0's sub-tables need a row bias (scale exponents -20..-12) while the others do not: each rank removes its
+    own bias before the all-reduce, so TP4 == the reference (and TP1)."""
+    import vllm.distributed as dist
+
+    monkeypatch.setenv("VLLM_DS41_ENGRAM_IMPL", "sm70")
+    syn = build_synthetic_engram(tmp_path / "mixed", seed=21)
+    from vllm.models.deepseek_v41.common.engram import EngramLayout
+
+    layout = EngramLayout.from_hf_config(syn.hf_config)
+    rng = np.random.default_rng(22)
+    for s in layout.subtables_for_rank(0, 4):
+        lo, n = layout.offsets[1][s], layout.primes[1][s]
+        syn.scales[14][lo:lo + n] = rng.integers(127 - 20, 127 - 12 + 1, size=(n, 8), dtype=np.uint8)
+    from .test_engram_synth import REAL_DATA_START, write_synthetic_shard
+
+    write_synthetic_shard(syn.row_dir / "model-00048-of-00048.safetensors", 14, syn.weights[14], syn.scales[14],
+                          REAL_DATA_START[14])
+    wkv = synthetic_wkv(23)
+    ids = np.random.default_rng(24).integers(3, 129000, size=64).astype(np.int32)
+    stream = random_stream(64, 25)
+    ranks = [make_module(syn, 14, r, 4, wkv) for r in range(4)]
+    try:
+        assert [svc.row_bias(14) for _, svc in ranks] == [5, 0, 0, 0]
+        for _, svc in ranks:
+            bind(svc, 0, ids, 64)
+        partials: list[list[torch.Tensor]] = [[] for _ in range(4)]
+        for r, (mod, _) in enumerate(ranks):
+            monkeypatch.setattr(dist, "tensor_model_parallel_all_reduce", lambda x, r=r: partials[r].append(x.clone()) or x)
+            mod(stream.cuda(), torch.arange(64, device="cuda"))
+        sums = iter([sum(partials[r][c] for r in range(4)) for c in range(len(partials[0]))])
+        monkeypatch.setattr(dist, "tensor_model_parallel_all_reduce", lambda x: next(sums))
+        out = ranks[2][0](stream.cuda(), torch.arange(64, device="cuda")).cpu()
+        ref = ref_engram(stream, table_rows(syn, ranks[0][1], 14, ids), *wkv)
+        print("tp4 mixed bias:", compare(out, ref, stream, "tp4-mixed-bias"))
+    finally:
+        for _, svc in ranks:
+            svc.shutdown()
+
+
 def test_wkv_loader_exactness_and_refusals(syn: SyntheticEngram) -> None:
     from vllm.models.deepseek_v41.common.engram import DeepseekV41Engram
     from vllm.models.deepseek_v41.common.engram_host import EngramHostService

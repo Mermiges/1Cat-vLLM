@@ -97,7 +97,7 @@ def _post_wkv_gate_kernel(stream_ptr, kv_ptr, qk_ptr, alpha, eps, clamp, inv_sqr
         acc_d += (h * q) * key
     rstd = tl.rsqrt(tl.sum(acc_h, axis=0) / DIM + eps) * tl.rsqrt(tl.sum(acc_k, axis=0) / DIM + eps)
     dot = tl.sum(acc_d, axis=0) * rstd * inv_sqrt_dim
-    g = tl.sqrt_rn(tl.maximum(tl.abs(dot), clamp))
+    g = tl.sqrt_rn(tl.maximum(tl.abs(dot), clamp, propagate_nan=tl.PropagateNan.ALL))   # clamp_min keeps NaN
     g = (g.to(tl.int32, bitcast=True) | (dot.to(tl.int32, bitcast=True) & -2147483648)).to(tl.float32, bitcast=True)
     gate = 1.0 / (1.0 + tl.exp(-g))
     for off in range(0, DIM, BLOCK):

@@ -525,6 +525,8 @@ class DeepseekV41Engram(nn.Module):
         rows = self.service.rows_buffer(self.layer_id, t_pad)
         _eager_wait()(self.service, self.layer_id, rows)
         row_bias = self.service.row_bias(self.layer_id)
+        # each rank removes ITS OWN power-of-two biases before the all-reduce (exact), so ranks whose sub-tables
+        # needed different row biases still sum consistently
         alpha = 2.0 ** -(WKV_BIAS_LOG2 + row_bias)
         if self.impl == "sm70":
             from vllm.models.deepseek_v41.sm70 import engram_kernels as ek
@@ -535,12 +537,13 @@ class DeepseekV41Engram(nn.Module):
             else:
                 x16 = decode_rows_torch(rows[a:b], row_bias)
             part = torch.mm(x16, self.wkv_r.t(), out_dtype=torch.float32)          # FP16 operands, FP32 out
+            part.mul_(alpha)
             if self.tp_size > 1:
                 from vllm.distributed import tensor_model_parallel_all_reduce
 
                 part = tensor_model_parallel_all_reduce(part)
             if self.impl == "sm70":
-                ek.post_wkv_gate_(stream[a:b], part, self.qk, alpha)
+                ek.post_wkv_gate_(stream[a:b], part, self.qk, 1.0)
             else:
-                post_wkv_gate_torch_(stream[a:b], part, self.qk, alpha)
+                post_wkv_gate_torch_(stream[a:b], part, self.qk, 1.0)
         return stream
