@@ -33,7 +33,7 @@ from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsPP
 from vllm.model_executor.models.utils import PPMissingLayer, extract_layer_index, make_layers, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
@@ -285,6 +285,8 @@ class DeepseekV41DecoderLayer(nn.Module):
 
 
 class DeepseekV41Model(nn.Module):
+    dspark_aux_layers: tuple[int, ...] = ()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -414,7 +416,8 @@ class DeepseekV41Model(nn.Module):
 
     def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
                 intermediate_tensors: IntermediateTensors | None,
-                inputs_embeds: torch.Tensor | None = None) -> torch.Tensor | IntermediateTensors:
+                inputs_embeds: torch.Tensor | None = None
+                ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if ds41_dump.ENABLED:
             ds41_dump.begin_step(positions, positions.shape[0])
         if self.pp_is_first:
@@ -430,10 +433,17 @@ class DeepseekV41Model(nn.Module):
                                    intermediate_tensors[C.PP_KEY_KV20_IK], intermediate_tensors[C.PP_KEY_CAND20],
                                    crc=intermediate_tensors[KV20_CRC_KEY] if self.kv20_crc_check else None)
         fused = self.hc_fused and stream.is_cuda
+        aux: list[torch.Tensor] = []  # DSpark: final-stage block inputs, FP32 transport
         pending: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         for layer in self.layers[self.start_layer:self.end_layer]:
             if isinstance(layer, PPMissingLayer):   # layer outside the configured subset
                 continue
+            if layer.layer_id in self.dspark_aux_layers:
+                from .dspark import capture_target_input
+
+                stream, captured = capture_target_input(stream, pending)
+                pending = None
+                aux.append(captured)
             if fused:
                 stream, pre, pending = layer.forward_fused(stream, pre, positions, pending)
             else:
@@ -442,8 +452,9 @@ class DeepseekV41Model(nn.Module):
             from .hc_kernels import hc_fused_step
 
             if self.pp_is_last:     # last FFN post fused with the final collapse + norm (no dump: pending is None)
-                return hc_fused_step(stream, sub_out=pending[0], post=pending[1], comb=pending[2],
-                                     collapse_pre=pre, norm_weight=self.norm.weight)[2]
+                hidden = hc_fused_step(stream, sub_out=pending[0], post=pending[1], comb=pending[2],
+                                      collapse_pre=pre, norm_weight=self.norm.weight)[2]
+                return (hidden, aux) if aux else hidden
             stream = hc_fused_step(stream, sub_out=pending[0], post=pending[1], comb=pending[2])[0]
         if not self.pp_is_last:
             num_tokens = stream.shape[0]
@@ -460,13 +471,14 @@ class DeepseekV41Model(nn.Module):
                 ds41_dump.end_forward()
             return IntermediateTensors(out)
         if not ds41_dump.ENABLED:
-            return hc_collapse(stream, pre, self.norm.weight)
+            hidden = hc_collapse(stream, pre, self.norm.weight)
+            return (hidden, aux) if aux else hidden
         collapsed = hc_pre(stream, pre)
         hidden = rmsnorm_to_act(collapsed, self.norm.weight)
         for name, t in (("final.stream_in", stream), ("final.hc", collapsed), ("final.h", hidden)):
             ds41_dump.dump(None, name, t)
         ds41_dump.end_forward()
-        return hidden
+        return (hidden, aux) if aux else hidden
 
 
 # ---------------------------------------------------------------- checkpoint names (§3.7)
@@ -509,7 +521,7 @@ def map_checkpoint_name(name: str) -> str:
     return mapped
 
 
-class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
+class DeepseekV41ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -535,9 +547,18 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        from .dspark import configure_target_capture
+
+        configure_target_capture(self.model, layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return (38, 39, 40)
+
     def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
                 intermediate_tensors: IntermediateTensors | None = None,
-                inputs_embeds: torch.Tensor | None = None) -> torch.Tensor | IntermediateTensors:
+                inputs_embeds: torch.Tensor | None = None
+                ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
