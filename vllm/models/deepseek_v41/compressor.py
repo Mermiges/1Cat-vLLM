@@ -72,19 +72,15 @@ def mm_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.mm(x, weight.t(), out_dtype=torch.float32)
 
 
-def mm_fp32_split(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """FP32 x [N, K] @ FP16 weight [M, K]^T with FP32-level accuracy on FP16 tensor cores: x = hi + lo with
-    hi = fp16(x), lo = fp16(x - hi); two FP16 GEMMs with FP32 accumulate/output (|x - hi - lo| <= 2^-22 |x|,
-    the FP16 weight is exact). Used where the result feeds an FP4 QAT (indexer q): a plain FP16 rounding of x
-    flips QAT values and changes near-tie top-512 picks."""
+def mm_fp32_full(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """FP32 x [N, K] @ FP16 weight [M, K]^T as an FP32 SGEMM (CUDA cores; V100 has no TF32). Used where the result
+    feeds an FP4 QAT (indexer q): any rounding before the QAT flips near-tie QAT values and changes top-512 picks.
+    vs the L-REF v100-semantic golden (p3_doc, layer 20, 2046 x 4096 q values): SGEMM 0 QAT mismatches; the earlier
+    split-FP16 (hi + lo) GEMM left 14 near-tie flips and a 97.85 % minimum top-512 overlap. FP16 x keeps the HMMA
+    path (exact products, FP32 accumulate)."""
     if x.dtype == torch.float16:
         return mm_fp32(x, weight)
-    xf = x.float()
-    hi = xf.to(torch.float16)
-    lo = (xf - hi.float()).to(torch.float16)
-    out = mm_fp32(hi, weight)
-    out += mm_fp32(lo, weight)
-    return out
+    return torch.mm(x.float(), weight.float().t())
 
 
 def compressed_metadata(name: str) -> DS41CompressedMetadata | None:

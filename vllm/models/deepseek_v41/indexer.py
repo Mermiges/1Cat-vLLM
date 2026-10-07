@@ -44,7 +44,7 @@ from vllm.models.deepseek_v41.common.contracts import (
     LayerTopology,
     SharedAttnBuffers,
 )
-from vllm.models.deepseek_v41.compressor import FP32RMSNorm, mm_fp32, mm_fp32_split
+from vllm.models.deepseek_v41.compressor import FP32RMSNorm, mm_fp32, mm_fp32_full
 from vllm.models.deepseek_v41.sm70.indexer_kernels import (
     index_k_rope_qat_store,
     index_q_rope_qat,
@@ -175,7 +175,7 @@ class DeepseekV41Indexer(nn.Module):
         # qr arrives in FP32 and the GEMM output stays FP32, so the only rounding before the FP4 QAT is the QAT
         # itself: FP16 rounding of qr or of q flips QAT values and changes near-tie top-512 picks (synthetic
         # layer 20: 60 % -> 99.5 % of tokens with the reference's exact top-512 set)
-        q = mm_fp32_split(qr[:T], self._w(self.wq_b, (IDX_HEADS * IDX_DIM, Q_LORA)))
+        q = mm_fp32_full(qr[:T], self._w(self.wq_b, (IDX_HEADS * IDX_DIM, Q_LORA)))
         q = index_q_rope_qat(q.view(T, IDX_HEADS, IDX_DIM), positions[:T], self._rope(), impl=impl)
         w = mm_fp32(x[:T], self._w(self.weights_proj, (IDX_HEADS, HIDDEN))) * (
             self.softmax_scale * IDX_HEADS ** -0.5)
