@@ -155,3 +155,23 @@ def test_gemv_rejects_large_m():
     w = torch.zeros(384, 5120, device="cuda", dtype=torch.float16)
     with pytest.raises(ValueError, match="at most 8 rows"):
         v41_gemv.gemv(x, w)
+
+
+@pytest.mark.parametrize("spill", [False, True])
+def test_route_prep_large_is_graph_capturable(spill):
+    ids = _ids(32, 6, 384, seed=5)  # 192 slots: the torch path
+    phys = torch.randperm(384, device="cuda", generator=torch.Generator(device="cuda").manual_seed(1)).to(torch.int32)
+    eager = mk.route_prep(ids, phys, 300, spill)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mk.route_prep(ids, phys, 300, spill)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mk.route_prep(ids, phys, 300, spill)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured[0], eager[0])
+    for (g, o), (ge, oe) in zip(captured[1], eager[1]):
+        assert torch.equal(g, ge) and torch.equal(o, oe)

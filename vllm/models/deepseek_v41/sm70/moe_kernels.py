@@ -90,30 +90,38 @@ def route_prep_reference(
     """Torch twin of the routing tables: ``(perm, [(gids0, goff0)] + ([(gids1, goff1)] if spill))``.
 
     ``perm`` lists slot indices sorted by (physical expert, slot); group ``g`` of a partition covers
-    ``perm[goff[g]:goff[g+1]]`` and names its partition-local expert ``gids[g]``.
+    ``perm[goff[g]:goff[g+1]]`` and names its partition-local expert ``gids[g]``. Fixed shapes and no host
+    synchronisation, so it also serves the large-slot path inside piecewise CUDA graphs.
     """
     flat = topk_ids.reshape(-1).to(torch.int64)
     key = phys_map.to(torch.int64)[flat] if phys_map is not None else flat
     num_slots = key.numel()
     device = key.device
-    perm = torch.argsort(key, stable=True)
+    perm = torch.sort(key, stable=True)[1]
     skey = key[perm]
     first = torch.ones(num_slots, dtype=torch.bool, device=device)
     first[1:] = skey[1:] != skey[:-1]
-    starts = torch.nonzero(first).flatten()
-    gkeys = skey[starts]
-    tables: list[tuple[torch.Tensor, torch.Tensor]] = []
-    parts = [(gkeys < n_resident, 0), (gkeys >= n_resident, n_resident)] if spill else [(None, 0)]
-    for sel, base in parts:
-        g_starts = starts if sel is None else starts[sel]
-        g_keys = gkeys if sel is None else gkeys[sel]
-        end = num_slots if sel is None or base > 0 else int((key < n_resident).sum().item())
-        gids = torch.zeros(num_slots, dtype=torch.int32, device=device)
-        goff = torch.full((num_slots + 1,), end, dtype=torch.int32, device=device)
-        gids[: g_keys.numel()] = (g_keys - base).to(torch.int32)
-        goff[: g_starts.numel()] = g_starts.to(torch.int32)
-        tables.append((gids, goff))
-    return perm.to(torch.int32), tables
+    group = torch.cumsum(first.to(torch.int64), 0) - 1
+    slots = torch.arange(num_slots, dtype=torch.int64, device=device)
+    goff = torch.full((num_slots + 1,), num_slots, dtype=torch.int64, device=device)
+    goff.scatter_reduce_(0, group, slots, reduce="amin")
+    gids = torch.zeros(num_slots, dtype=torch.int64, device=device)
+    gids.scatter_(0, group, skey)
+    if not spill:
+        return perm.to(torch.int32), [(gids.to(torch.int32), goff.to(torch.int32))]
+    resident = skey < n_resident
+    n_res_slots = resident.sum()
+    n_res_groups = (first & resident).sum()
+    idx1 = torch.arange(num_slots + 1, dtype=torch.int64, device=device)
+    goff0 = torch.where(idx1 < n_res_groups, goff, n_res_slots)
+    gids0 = torch.where(idx1[:-1] < n_res_groups, gids, 0)
+    shifted = torch.clamp(idx1 + n_res_groups, max=num_slots)
+    goff1 = goff.gather(0, shifted)
+    n_groups = first.sum()
+    gids1 = torch.where(idx1[:-1] + n_res_groups < n_groups,
+                        gids.gather(0, torch.clamp(idx1[:-1] + n_res_groups, max=num_slots - 1)) - n_resident, 0)
+    return perm.to(torch.int32), [(gids0.to(torch.int32), goff0.to(torch.int32)),
+                                  (gids1.to(torch.int32), goff1.to(torch.int32))]
 
 
 def route_prep(
