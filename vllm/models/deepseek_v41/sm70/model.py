@@ -29,6 +29,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.distributed.utils import get_pp_indices
+from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
@@ -51,7 +52,9 @@ ENGRAM_DIR_KNOB = "VLLM_DS41_CORE_ENGRAM_DIR"
 ENGRAM_DIR_DEFAULT = "/home/mermiges/ds41-engram"
 SPILL_KNOB = "VLLM_DS41_CORE_SPILL_EXPERTS_PER_LAYER"
 LAYER_SUBSET_KNOB = "VLLM_DS41_CORE_LAYER_SUBSET"   # e.g. "0,1,2,3": run only these backbone layers (I1 / smoke)
+LAYER_SUBSET_ALLOW_KNOB = "VLLM_DS41_CORE_ALLOW_LAYER_SUBSET"   # must be 1 too: a subset is a debug-only partial model
 
+logger = init_logger(__name__)
 _LAYER_RE = re.compile(r"^layers\.(\d+)\.")
 _SKIP_PREFIXES = ("vision.", "aligner.", "image_", "mtp.")
 
@@ -105,6 +108,10 @@ def parse_layer_subset(stage: StagePlan, config: Any) -> frozenset[int] | None:
     raw = knobs.env_str(LAYER_SUBSET_KNOB, "")
     if raw == "":
         return None
+    if not knobs.env_bool(LAYER_SUBSET_ALLOW_KNOB, False):
+        # MC-CORE F6: a subset inherited from the shell would silently serve a partial model
+        raise ValueError(f"{LAYER_SUBSET_KNOB}={raw!r} is set but {LAYER_SUBSET_ALLOW_KNOB} is not 1: a layer subset runs a "
+                         "partial (debug) model; set both to use it, or unset the subset")
     try:
         subset = frozenset(int(tok) for tok in raw.split(",") if tok.strip() != "")
     except ValueError as exc:
@@ -117,6 +124,8 @@ def parse_layer_subset(stage: StagePlan, config: Any) -> frozenset[int] | None:
             if src is not None and src not in subset:
                 raise ValueError(f"{LAYER_SUBSET_KNOB}: layer {layer} needs source layer {src}, which is not in "
                                  f"the subset {sorted(subset)}")
+    logger.warning("DeepSeek-V4.1 DEBUG layer subset active: running only backbone layers %s (partial model)",
+                   sorted(subset))
     return frozenset(layer for layer in subset if stage.first_layer <= layer <= stage.last_layer)
 
 

@@ -71,6 +71,7 @@ def _worker(rank: int, port: int, shards: list[str], out_dir: str) -> None:
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
     os.environ["VLLM_DS41_CORE_LAYER_SUBSET"] = ",".join(map(str, LAYERS))
+    os.environ["VLLM_DS41_CORE_ALLOW_LAYER_SUBSET"] = "1"
     core_stubs.install()
     report: dict = {"rank": rank, "device": torch.cuda.get_device_name(rank)}
     from vllm.config import ModelConfig

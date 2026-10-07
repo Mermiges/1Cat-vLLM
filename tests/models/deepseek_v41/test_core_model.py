@@ -94,6 +94,7 @@ def _build(ckpt: Path, monkeypatch: pytest.MonkeyPatch, subset: str = "0,1,2,3")
     core_stubs.install(monkeypatch.setitem)
     monkeypatch.setattr(core_stubs, "ALLOCATE_EXPERTS", False)
     monkeypatch.setenv("VLLM_DS41_CORE_LAYER_SUBSET", subset)
+    monkeypatch.setenv("VLLM_DS41_CORE_ALLOW_LAYER_SUBSET", "1")
     from vllm.models.deepseek_v41.sm70.model import DeepseekV41ForCausalLM
 
     vc = _vllm_config(ckpt)
@@ -336,3 +337,15 @@ def test_engram_io_threads_from_pp_size(loaded_model) -> None:
     assert [engram_io_threads(n) for n in (1, 2, 3)] == [4, 2, 1]
     model, _, _ = loaded_model
     assert model.engram_service.io_threads == 4
+
+
+def test_layer_subset_needs_explicit_debug_flag(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
+    """MC-CORE F6: an inherited VLLM_DS41_CORE_LAYER_SUBSET alone is refused."""
+    core_stubs.install(monkeypatch.setitem)
+    from vllm.models.deepseek_v41.sm70.model import DeepseekV41Model
+
+    monkeypatch.setenv("VLLM_DS41_CORE_LAYER_SUBSET", "0,1,2,3")
+    monkeypatch.delenv("VLLM_DS41_CORE_ALLOW_LAYER_SUBSET", raising=False)
+    vc = _vllm_config(ds41_checkpoint_dir)
+    with set_current_vllm_config(vc), pytest.raises(ValueError, match="ALLOW_LAYER_SUBSET"):
+        DeepseekV41Model(vllm_config=vc, prefix="model")
