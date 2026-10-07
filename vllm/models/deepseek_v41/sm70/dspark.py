@@ -377,7 +377,9 @@ class DSparkModel(nn.Module):
         self.main_norm = DeepseekV41Norm(C.HIDDEN)
         self.layers = nn.ModuleList(
             [
-                DSparkBlock(vc, f"{prefix}.layers.{i}", 40 + i, stage, shared)
+                # KV names merge globally across PP workers. Reserve the
+                # post-backbone ids, as V4 does; ModuleList weight ids stay 0..2.
+                DSparkBlock(vc, f"{prefix}.layers.{40 + i}", 40 + i, stage, shared)
                 for i in range(3)
             ]
         )

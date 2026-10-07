@@ -23,6 +23,7 @@ def test_noncausal_same_context_and_all_queries(anchor, monkeypatch):
     # CPU-only test: the CUDA platform's global default enables pinned memory.
     monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     builder = object.__new__(DSparkMetadataBuilder)
+    builder._mirror_checks = []
     builder.device = torch.device("cpu")
     builder.kernel_block_size = 16
     builder.kv_cache_spec = SimpleNamespace(block_size=16)
