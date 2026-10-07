@@ -102,3 +102,14 @@ def test_vllm_model_config_parses_official_checkpoint(ds41_checkpoint_dir: Path)
     assert mc.tokenizer_mode == "deepseek_v41"          # auto-selected for the architecture
     cls, arch = ModelRegistry.resolve_model_cls(mc.architectures, mc)
     assert cls.__module__ == "vllm.models.deepseek_v41.sm70.model" and cls.supports_pp
+
+
+def test_breakable_cudagraph_architectures() -> None:
+    """PORT_DESIGN §9 AM-8: V4.1 auto-enables the breakable CUDA graph like V4 (V4 entries unchanged)."""
+    import inspect
+
+    from vllm.config import vllm as vllm_config_module
+
+    archs = vllm_config_module.BREAKABLE_CUDAGRAPH_ARCHITECTURES
+    assert {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel", "DeepseekV41ForCausalLM"} <= set(archs)
+    assert "a in BREAKABLE_CUDAGRAPH_ARCHITECTURES" in inspect.getsource(vllm_config_module.VllmConfig)
