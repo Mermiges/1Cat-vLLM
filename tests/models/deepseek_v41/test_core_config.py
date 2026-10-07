@@ -86,3 +86,18 @@ def test_quant_method_claim(ds41_checkpoint_dir: Path) -> None:
     assert _resolve_quant_method({"quant_method": "fp8", "weight_block_size": [128, 128]}, v4) == "deepseek_v4_fp8"
     other = SimpleNamespace(model_type="llama")
     assert _resolve_quant_method({"quant_method": "fp8", "weight_block_size": [128, 128]}, other) is None
+
+
+@pytest.mark.sm70
+def test_vllm_model_config_parses_official_checkpoint(ds41_checkpoint_dir: Path) -> None:
+    """ModelConfig resolves the architecture to the SM70 port (registry import needs a CUDA SM70 platform)."""
+    import torch
+
+    from vllm.config import ModelConfig
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    mc = ModelConfig(model=str(ds41_checkpoint_dir), dtype="half", skip_tokenizer_init=True, max_model_len=32768)
+    assert mc.architectures == ["DeepseekV41ForCausalLM"] and mc.quantization == "deepseek_v41_fp8"
+    assert mc.dtype == torch.float16 and mc.is_moe and mc.hf_text_config is mc.hf_config
+    cls, arch = ModelRegistry.resolve_model_cls(mc.architectures, mc)
+    assert cls.__module__ == "vllm.models.deepseek_v41.sm70.model" and cls.supports_pp
