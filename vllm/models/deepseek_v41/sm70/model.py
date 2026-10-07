@@ -394,6 +394,9 @@ _STACKED = (
     ("shared_experts.gate_up_proj.", "shared_experts.w1.", 0),
     ("shared_experts.gate_up_proj.", "shared_experts.w3.", 1),
 )
+_STACKED_SHARDS: dict[str, dict[int, str]] = {}   # fused param fragment -> {shard id: checkpoint fragment}
+for _param_frag, _ckpt_frag, _shard in _STACKED:
+    _STACKED_SHARDS.setdefault(_param_frag, {})[_shard] = _ckpt_frag
 _RENAMES = (("shared_experts.w2.", "shared_experts.down_proj."),)
 _EXPERT_SCALE_RE = re.compile(r"(\.experts\.\d+\.w[123])\.scale$")
 _EXPERT_KEY_RE = re.compile(r"experts\.\d+\.w[123]\.")
@@ -496,6 +499,12 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                            if name.startswith("model.layers.") and name.endswith(".engram")
                            and callable(getattr(module, "load_weights", None))}
         expert_mapping: dict[str, tuple[str, int, str]] = {}
+        # N1: a fused / expert-stacked parameter is complete only when EVERY shard reached it -- one shard marks the
+        # parameter "loaded" but leaves the other rows torch.empty garbage. parts[param] = the shard keys it got,
+        # expected[param] = the full key set (stacked: shard ids; routed experts: (expert_id, shard_id) pairs).
+        parts: dict[str, set[object]] = {}
+        expected: dict[str, frozenset[object]] = {}
+        expert_keys: dict[str, set[object]] = {}
         if any(isinstance(m, DeepseekV41DecoderLayer) for m in self.model.layers):
             from .moe import DeepseekV41MoE
 
@@ -503,6 +512,7 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 if not _EXPERT_KEY_RE.fullmatch(weight_name):
                     raise ValueError(f"unexpected expert mapping entry {weight_name!r} (expected experts.<e>.w<k>.)")
                 expert_mapping[weight_name] = (param_name, expert_id, shard_id)
+                expert_keys.setdefault(param_name, set()).add((expert_id, shard_id))
         tp_rank, tp_size = get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
         loaded: set[str] = set()
         delegated: dict[str, list[tuple[str, torch.Tensor]]] = {}
@@ -515,7 +525,10 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 delegated.setdefault(delegate, []).append((ckpt_name.split(".engram.", 1)[1], tensor))
                 continue
             if ".ffn.experts." in name:
-                loaded.add(self._load_expert(params, name, tensor, expert_mapping))
+                mapped, param_frag, key = self._load_expert(params, name, tensor, expert_mapping)
+                loaded.add(mapped)
+                parts.setdefault(mapped, set()).add(key)
+                expected[mapped] = frozenset(expert_keys[param_frag])
                 continue
             for param_frag, ckpt_frag, shard_id in _STACKED:
                 if ckpt_frag in name:
@@ -524,6 +537,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                         param = params[stacked]
                         param.weight_loader(param, tensor, shard_id)
                         loaded.add(stacked)
+                        parts.setdefault(stacked, set()).add(shard_id)
+                        expected[stacked] = frozenset(_STACKED_SHARDS[param_frag])
                         break
             else:
                 if name not in params:
@@ -551,10 +566,20 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 raise RuntimeError(f"{prefix}.load_weights consumed {sorted(consumed)} of {sorted(given)}; "
                                    f"unconsumed {sorted(given - consumed)}, unknown {sorted(consumed - given)}")
             loaded.update(f"{prefix}.{name}" for name, _ in module.named_parameters())
-        self._check_complete(loaded)
+        self._check_complete(loaded, {name: expected[name] - got for name, got in parts.items()})
         return loaded
 
-    def _check_complete(self, loaded: set[str]) -> None:
+    @staticmethod
+    def _describe_missing_parts(name: str, missing: set[object]) -> str:
+        keys = sorted(missing, key=repr)
+        if all(isinstance(k, tuple) for k in keys):     # routed experts: (expert_id, shard_id)
+            shown = ", ".join(f"expert {e} {shard}" for e, shard in keys[:8])
+        else:
+            frag = next(f for f in _STACKED_SHARDS if f in name)
+            shown = ", ".join(_STACKED_SHARDS[frag][k].rstrip(".") for k in keys[:8])
+        return f"{name} lacks {shown}" + (f", ... ({len(keys)} total)" if len(keys) > 8 else "")
+
+    def _check_complete(self, loaded: set[str], missing_parts: dict[str, set[object]] | None = None) -> None:
         """Every parameter that needs checkpoint data must have been filled. vLLM's own completeness check is off
         whenever a quantization method is set (always, for this model), so a missing shard would otherwise leave
         torch.empty garbage / initial values and the server would come up (rule 9). Exempt: zero-size parameters and
@@ -565,14 +590,23 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 derived.add(f"{mod_name}.{rel}" if mod_name else rel)
         missing = sorted(name for name, param in self.named_parameters()
                          if name not in loaded and name not in derived and param.numel() > 0)
+        partial = sorted((name, keys) for name, keys in (missing_parts or {}).items() if keys)
+        problems: list[str] = []
         if missing:
             shown = ", ".join(missing[:20]) + (f", ... ({len(missing)} total)" if len(missing) > 20 else "")
-            raise RuntimeError(f"DeepSeek-V4.1 checkpoint did not provide {len(missing)} parameter(s) of this stage: "
-                               f"{shown}. Check that all 48 shards are present and verified in the model directory.")
+            problems.append(f"did not provide {len(missing)} parameter(s) of this stage: {shown}")
+        if partial:
+            shown = "; ".join(self._describe_missing_parts(name, keys) for name, keys in partial[:20])
+            more = f"; ... ({len(partial)} total)" if len(partial) > 20 else ""
+            problems.append(f"filled only part of {len(partial)} fused/expert parameter(s): {shown}{more}")
+        if problems:
+            raise RuntimeError(f"DeepSeek-V4.1 checkpoint {' and '.join(problems)}. Check that all 48 shards are "
+                               "present and verified in the model directory.")
 
     @staticmethod
     def _load_expert(params: dict[str, nn.Parameter], name: str, tensor: torch.Tensor,
-                     expert_mapping: dict[str, tuple[str, int, str]]) -> str:
+                     expert_mapping: dict[str, tuple[str, int, str]]) -> tuple[str, str, tuple[int, str]]:
+        """Load one routed-expert tensor; returns (parameter name, mapping param fragment, (expert_id, shard_id))."""
         if name.endswith(".weight_scale") and tensor.dtype == torch.float8_e8m0fnu:
             tensor = tensor.view(torch.uint8)   # keep raw E8M0 bytes (copy_ would convert values)
         match = _EXPERT_KEY_RE.search(name)
@@ -587,4 +621,4 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
         loader = typing.cast(Callable[..., bool], param.weight_loader)
         if not loader(param, tensor, mapped, shard_id=shard_id, expert_id=expert_id, return_success=True):
             raise RuntimeError(f"expert weight_loader refused {name!r} -> {mapped!r} (expert {expert_id})")
-        return mapped
+        return mapped, param_name, (expert_id, shard_id)
