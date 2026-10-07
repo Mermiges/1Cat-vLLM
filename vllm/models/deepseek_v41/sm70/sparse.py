@@ -25,19 +25,47 @@ stage vs 928 / 1161 / 571 MiB with 64-token SWA and 8-token state blocks.
 
 from __future__ import annotations
 
-import torch
+from dataclasses import dataclass
+from typing import ClassVar
 
+import numpy as np
+import torch
+from torch import nn
+
+from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common.contracts import (
     CKV_CACHE_DTYPE_STR,
     CKV_RECORD_DIM,
+    HEAD_DIM,
+    IDX_TOPK,
     IK_CACHE_DTYPE_STR,
     IK_RECORD_DIM,
     KV_MODEL_VERSION,
     KV_RECORD_DTYPE,
+    N_HEADS,
     SWA_RECORD_DIM,
     WINDOW,
 )
-from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+from vllm.models.deepseek_v41.sm70.sparse_kernels import (
+    logical_to_rows,
+    sparse_attention,
+)
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+    MultipleOf,
+)
+from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 
 STATE_ROW_DIM = 2 * CKV_RECORD_DIM   # FP32 [kv 512 | score 512] of one token (ratio-2 pairing)
 STATE_WINDOW = 2
@@ -96,24 +124,6 @@ def _check_mla_block(block_size: int, compress_ratio: int) -> None:
 # =====================================================================================
 # metadata (built once per KV-cache group and step; read by every layer of the group)
 # =====================================================================================
-
-from dataclasses import dataclass  # noqa: E402
-from typing import ClassVar  # noqa: E402
-
-import numpy as np  # noqa: E402
-from torch import nn  # noqa: E402
-
-from vllm.config import VllmConfig, get_current_vllm_config  # noqa: E402
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase  # noqa: E402
-from vllm.v1.attention.backend import (  # noqa: E402
-    AttentionBackend,
-    AttentionCGSupport,
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-    MultipleOf,
-)
-from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping  # noqa: E402
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec  # noqa: E402
 
 
 @dataclass
@@ -400,10 +410,6 @@ class DS41CacheLayer(nn.Module, AttentionLayerBase):
 # =====================================================================================
 # sparse attention over FP16 records (decode + chunked prefill share one gather path)
 # =====================================================================================
-
-from vllm.models.deepseek_v41 import knobs  # noqa: E402
-from vllm.models.deepseek_v41.common.contracts import HEAD_DIM, IDX_TOPK, N_HEADS  # noqa: E402
-from vllm.models.deepseek_v41.sm70.sparse_kernels import logical_to_rows, sparse_attention  # noqa: E402
 
 TILE_ENV = "VLLM_DS41_ATTN_TILE"
 
