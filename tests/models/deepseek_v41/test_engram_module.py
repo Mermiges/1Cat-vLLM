@@ -441,11 +441,7 @@ def _golden_cases() -> list[Path]:
 @pytest.mark.parametrize("case", _golden_cases() or [None], ids=lambda c: c.name if c else "none")
 def test_engram_vs_golden(case: Path | None, monkeypatch: pytest.MonkeyPatch) -> None:
     """Per captured Engram layer: hash ids and dequantised rows bitwise; key/value (rel-RMS <= 1e-5) and gate
-    (|diff| <= 1e-5) from the module's own decode + FP16 GEMM path; module output stream vs the golden output.
-
-    The v100-semantic golden keeps the stream in FP32 while the port stores it in BF16 (PORT_DESIGN A4): BF16 rounding
-    alone is ~1.6e-3 rel-RMS, so the stream is compared against the golden rounded to BF16 (rel-RMS <= 1e-3) and the
-    raw FP32 metric is reported."""
+    (|diff| <= 1e-5) from the module's own decode + FP16 GEMM path; module output stream (see below)."""
     if case is None:
         pytest.skip(f"no final L-REF golden case with engram_applied under {GOLDEN_DIR} yet")
     import json
@@ -505,14 +501,25 @@ def test_engram_vs_golden(case: Path | None, monkeypatch: pytest.MonkeyPatch) ->
             dot = (h32 * qk * key).sum(-1) * rstd * 5120 ** -0.5
             gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
             assert (gate - g["engram.gate"].float()).abs().max().item() <= 1e-5
-            stream = h32.to(torch.bfloat16).cuda()
-            out = mod(stream, torch.from_numpy(pos).cuda()).float().cpu()
+            # The port's stream is BF16 (A4); the v100-semantic golden's is FP32. Rounding the input and the output
+            # to BF16 alone costs ~2e-3 rel-RMS, so the module is gated against the reference gate math applied to
+            # the same BF16 input with the GOLDEN key/value (<= 1e-3), and the FP32-golden metric is reported.
+            h16 = h32.to(torch.bfloat16)
+            out = mod(h16.cuda(), torch.from_numpy(pos).cuda()).float().cpu()
+            gk, gv = g["engram.key"].float(), g["engram.value"].float()
+            hb = h16.float()
+            rstd_b = torch.rsqrt(hb.square().mean(-1) + 1e-20) * torch.rsqrt(gk.square().mean(-1) + 1e-20)
+            dot_b = (hb * qk * gk).sum(-1) * rstd_b * 5120 ** -0.5
+            gate_b = torch.sigmoid(torch.copysign(dot_b.abs().clamp_min(1e-6).sqrt(), dot_b))
+            ref_b = (hb + gate_b.unsqueeze(-1) * gv.unsqueeze(-2)).to(torch.bfloat16).float()
+            rel_b = ((out - ref_b).norm() / ref_b.norm()).item()
             gold = g["engram.out"].float()
-            gold16 = gold.to(torch.bfloat16).float()
-            rel16 = ((out - gold16).norm() / gold16.norm()).item()
             rel32 = ((out - gold).norm() / gold.norm()).item()
-            print(f"{case.name} L{layer}: stream rel-RMS vs bf16(golden) {rel16:.2e}, vs FP32 golden {rel32:.2e}")
-            assert rel16 <= 1e-3 and (out - gold).abs().max().item() <= 1e-2 * gold.abs().max().item()
+            d_gold = gold - h32
+            d_rel = ((out - hb - d_gold).norm() / d_gold.norm()).item()
+            print(f"{case.name} L{layer}: stream rel-RMS vs golden-kv/BF16-input ref {rel_b:.2e}; vs FP32 golden "
+                  f"{rel32:.2e} (BF16 storage floor); Engram delta vs golden {d_rel:.2e}")
+            assert rel_b <= 1e-3 and (out - ref_b).abs().max().item() <= 1e-2 * ref_b.abs().max().item()
         finally:
             svc.shutdown()
     if not found:
