@@ -3,14 +3,18 @@
 """L-ATTN vs L-REF golden tensors (PORT_DESIGN §3.8, §4.5; mode v100-semantic = the primary comparator).
 
 Per-op tests feed the golden's inputs to one port op and compare with the golden output:
-  * q path        attn.x  -> attn.qr, attn.q (dense-linear gate 2e-3), attn.kv_win (QAT-valued: reported)
+  * q path        attn.x  -> attn.qr, attn.q (dense-linear gate 2e-3); attn.x in FP32 -> port window-KV kernel ->
+                  attn.kv_win bitwise (0 mismatches); FP16-rounded attn.x (the port's real input) -> <= 3 % flips
   * indexer       idx.q, idx.w, cache.ik -> idx.score (rel-RMS <= 1e-3, -inf pattern exact) -> idx.topk (same set)
   * candidates    idx.score (layer 20) -> cand.blocks (set equality)
   * sparse attn   attn.q + window/compressed records + attn.topk_all -> attn.o (<= 2e-3)
   * o-proj        attn.o -> attn.out (dense-linear gate 2e-3)
-and a golden-input end-to-end run: attn.x of the prefill (in chunks) and of decode1..4 through DeepseekV41Attention
-on the simulated paged cache -> attn.out per step, top-512 overlap (>= 99.5 % mean, >= 98 % min), compressor
-latent (<= 1e-3).
+a long-context indexer test on p4_long (24.6K tokens, layers 20/24: real candidate blocks beyond 16,384), and a
+golden-input end-to-end run: attn.x of the prefill (in chunks) and of decode1..4 through DeepseekV41Attention on the
+simulated paged cache, gated in three links (see test_golden_layer_end_to_end):
+  golden ~ ref32 (own FP32 reference fed FP32 attn.x)            -- validates the reference
+  ref16  (same reference fed the FP16-rounded attn.x the port gets) -- input-rounding floor, not gated vs golden
+  port   ~ ref16 at the §4.5 per-op gates                          -- the port's own error.
 
 Goldens: $DS41_GOLDEN_DIR (default /mnt/nvme2/scratch/ds41/golden), final cases preferred over provisional/. Layers
 not captured in the available batch are skipped (the PROV-2 batch has 0, 1, 2, 3, 14; later batches add 20, 21, 24).
@@ -29,6 +33,7 @@ import torch
 from vllm.models.deepseek_v41.common.candidate_blocks import select_candidate_blocks
 from vllm.models.deepseek_v41.common.contracts import CAND_ALL
 from vllm.models.deepseek_v41.sm70.indexer_kernels import index_scores, topk_sorted
+from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 from vllm.models.deepseek_v41.sm70.sparse_kernels import sparse_attention
 
 from .test_attn_harness import load_attn_weights, ref_config, rel_rms, topology
@@ -138,10 +143,19 @@ def test_golden_per_op(dist_env, weights_cache, prompt: str, layer: int) -> None
         gq = g("attn.q")
         report.setdefault("qr", []).append(rel_rms(qr32, g("attn.qr")))
         report.setdefault("q", []).append(rel_rms(q, gq))
-        kv = attn.kv_norm(qr_kv[:, 1280:])
-        from vllm.models.deepseek_v41.common import qat
-        kv_win = qat.fp8_block32_qdq(apply_rope_torch(kv, pos, attn.rotary_emb.cos_sin_cache), out_dtype=torch.float32)
-        report.setdefault("kv_win_mismatch", []).append(float((kv_win != g("attn.kv_win")).float().mean()))
+        # ---- window-KV records through the port kernel (RoPE + FP8 QAT -> FP16 rows). The golden computes the kv
+        # projection from FP32 attn.x: fed the same FP32 x the kernel must reproduce every record bit for bit;
+        # fed the FP16-rounded x of the real forward, QAT flips of up to one FP8 step remain (reported + bounded).
+        gkw = g("attn.kv_win")
+        x32 = g("attn.x")
+        w_kv = attn.fused_wqa_wkv.weight[1280:]
+        for tag, kv_pre in (("kv_win_mismatch_x32", x32 @ w_kv.float().t()),
+                            ("kv_win_mismatch_x16", qr_kv[:, 1280:])):
+            kv = attn.kv_norm(kv_pre)
+            kv_rows = torch.empty(T, 512, dtype=torch.float16, device=DEV)
+            q_rope_kv_insert(torch.zeros(T, 1, 512, dtype=torch.float16, device=DEV), kv, pos,
+                             attn.rotary_emb.cos_sin_cache, kv_rows, torch.arange(T, device=DEV), impl="sm70")
+            report.setdefault(tag, []).append(float((kv_rows.float() != gkw).float().mean()))
         # ---- o-proj fed the golden attention output
         go = g("attn.o")
         out = attn.output_projection(go.half().contiguous(), pos[rows])
@@ -221,6 +235,10 @@ def test_golden_per_op(dist_env, weights_cache, prompt: str, layer: int) -> None
     assert max(report["q"]) <= 2e-3 and max(report["qr"]) <= 2e-3, report
     assert max(report["oproj"]) <= 2e-3, report
     assert max(report["sparse"]) <= 2e-3, report
+    assert max(report["kv_win_mismatch_x32"]) == 0.0, report       # bitwise window-KV records (MC-ATTN F4)
+    assert max(report["kv_win_mismatch_x16"]) <= 0.03, report      # measured <= 2.2 % (FP16 input rounding)
+    if "idx_q_mismatch" in report:
+        assert max(report["idx_q_mismatch"]) <= 1e-4, report        # FP4 q from golden attn.qr (split-FP16 GEMM)
     if "score" in report:
         assert max(report["score"]) <= 1e-3, report
         assert min(report["topk_same_set_from_golden_scores"]) >= 0.99, report
