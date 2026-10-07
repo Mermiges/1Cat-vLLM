@@ -14,8 +14,9 @@ of each output row, 1/16 extra) and one of three kernels runs per call, all read
 * ``dequant``: larger M, or FP32 output above the GEMV range: ``fp8_sm70_dequantize_out`` rebuilds the FP16 weight
   (bitwise equal to the P2 fallback's) into a transient buffer and cuBLAS runs the product (FP16 or FP32 output).
 
-Exactness: E4M3 x 2^e is an FP16 value for e in [-15, 15] (subnormals included) and the scale itself must be an FP16
-normal (e >= -14); the measured dense exponents are -13..-6 (MODEL_ARCHAEOLOGY §11), so every path multiplies the
+Exactness: E4M3 x 2^e is a finite FP16 value for every code when -15 <= e <= 7 (smallest subnormal 2^-9 x 2^-15 =
+2^-24; largest 448 x 2^7 = 57344 <= 65504, while 448 x 2^8 overflows) and the scale itself must be an FP16 normal
+(e >= -14), so the window is [-14, 7]; the measured dense exponents are -13..-6 (MODEL_ARCHAEOLOGY §11), so every path multiplies the
 same weights as the FP16 fallback and differs from it only in FP32 accumulation order. ``prepare_fp8_g32`` checks
 every scale and fails loudly otherwise (Engram ``wkv``, with exponents down to -18, is not eligible).
 
@@ -34,7 +35,7 @@ from vllm.triton_utils import tl, triton
 
 GROUP = 32
 PANEL = 32                # TurboMind FP8 B-operand panel: 32 output rows x K, stored [K/8][32][8]
-_SCALE_EXP_MIN, _SCALE_EXP_MAX = -14, 15
+_SCALE_EXP_MIN, _SCALE_EXP_MAX = -14, 7  # every E4M3 code x 2^e is a finite, exact FP16 value (module doc)
 GEMV_MAX_M = 8            # the GEMV unrolls up to 8 rows
 GEMV_MAX_M_FP16 = 2       # FP16 output: GEMV for M <= 2, TurboMind above (P5 bench, L-MOE progress)
 TM_MAX_M = 64             # FP16 output: TurboMind up to here, dequant + cuBLAS above

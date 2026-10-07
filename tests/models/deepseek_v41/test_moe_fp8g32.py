@@ -167,6 +167,37 @@ def test_refuses_inexact_scales_and_shapes():
         fp8_g32.fp8_g32_linear(torch.randn(2, 1024, device="cuda"), tw)
 
 
+@pytest.mark.parametrize("exp", [-14, 7])
+def test_exponent_window_edges_are_exact_on_every_path(exp):
+    """At the window edges every path returns E4M3 x 2^e exactly: 448 x 2^7 = 57344 (largest finite), and the
+    smallest subnormal 2^-9 x 2^-14."""
+    n, k = 64, 256
+    codes = torch.full((n, k), 0x01, dtype=torch.uint8, device="cuda")      # 2^-9
+    codes[:, ::2] = 0x7E                                                    # 448
+    codes[1::2] |= 0x80                                                     # negative rows
+    w = codes.view(torch.float8_e4m3fn)
+    s = torch.full((n // 32, k // 32), 127 + exp, dtype=torch.uint8, device="cuda")
+    ref = fp8_g32.dequant_fp8_g32_reference(w, s)
+    assert torch.equal(ref.half().float(), ref) and torch.isfinite(ref.half()).all()
+    tw = fp8_g32.prepare_fp8_g32(w, s)
+    torch.testing.assert_close(fp8_g32.dequant_fp8_g32(tw), ref.t().half(), rtol=0, atol=0)
+    x = torch.zeros(8, k, dtype=torch.float16, device="cuda")
+    x[torch.arange(8), torch.arange(8)] = 1.0
+    expect = ref[:, :8].t()
+    for dt in (torch.float32, torch.float16):
+        torch.testing.assert_close(fp8_g32.fp8_g32_gemv(x, tw, out_dtype=dt), expect.to(dt), rtol=0, atol=0)
+    torch.testing.assert_close(fp8_g32.fp8_g32_turbomind(x, tw), expect.half(), rtol=0, atol=0)
+
+
+def test_refuses_overflowing_exponent():
+    """e = 8: 448 x 2^8 = 114688 is not an FP16 value (FP16 paths would give inf/NaN, the FP32 GEMV 114688)."""
+    w, s = _rand_fp8(64, 256, seed=6)
+    s_hi = s.clone()
+    s_hi[1, 3] = 127 + 8
+    with pytest.raises(ValueError, match=r"outside the exact FP16 window \[-14, 7\]"):
+        fp8_g32.prepare_fp8_g32(w, s_hi)
+
+
 def test_group128_path_unchanged():
     """DeepSeek-V4 / generic 128 x 128 block FP8 keeps running through the same ops."""
     from vllm import _sm70_ops as sm70_ops
