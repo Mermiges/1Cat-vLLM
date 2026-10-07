@@ -53,10 +53,10 @@ V41_MODEL_TYPES = ("deepseek_v41", "deepseek_v41_text")
 V41_WEIGHT_BLOCK = [32, 32]
 
 DENSE_G32_KNOB = "VLLM_DS41_MOE_DENSE_G32"
-DENSE_G32_DEFAULT = False
-# DEFAULT stays False until the call-site seam (v41_linear / v41_grouped_linear in attention.py, DCR in
-# P5-MOE.progress.md) is merged: without it the switched layers fail loudly at the first forward. Basis for turning it
-# on afterwards: per-layer goldens pass (39/39) and the switched set wins at M <= 8 on board B (P5-MOE progress).
+DENSE_G32_DEFAULT = True
+# The attention call-site seam is integrated (dc5353555). SOL-MOE verified
+# all 112 HANDOFF tests, including 39 g32 and 41 attention golden gates.
+# The switched set wins at M <= 8 on board B (180 W; P5-MOE measurements).
 # layer-prefix suffixes kept FP8 (group 32) when the knob is on; everything else keeps the FP16 fallback.
 # attn.indexer.wq_b is NOT switched: its FP32-input product must stay bitwise the fallback's SGEMM (L-ATTN idx.q gate);
 # the FP32-x GEMV flips 1e-6..3e-6 of the QAT'd q values on the goldens, and the bitwise path (row dequant + SGEMM)

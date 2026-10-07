@@ -45,6 +45,18 @@ def _route_prep_small_kernel(
     i = tl.arange(0, BLOCK)
     valid = i < S
     expert = tl.load(ids_ptr + i, mask=valid, other=0)
+    _route_prep_small(expert, phys_ptr, perm_ptr, gids0_ptr, goff0_ptr,
+                      gids1_ptr, goff1_ptr, S, n_resident, HAS_PHYS, SPILL, BLOCK)
+
+
+@triton.jit
+def _route_prep_small(
+    expert, phys_ptr, perm_ptr, gids0_ptr, goff0_ptr, gids1_ptr, goff1_ptr,
+    S, n_resident, HAS_PHYS: tl.constexpr, SPILL: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Shared route-table body; the fused decode front passes selected ids directly."""
+    i = tl.arange(0, BLOCK)
+    valid = i < S
     if HAS_PHYS:
         key = tl.load(phys_ptr + expert, mask=valid, other=0)
     else:
