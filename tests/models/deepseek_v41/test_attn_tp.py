@@ -76,7 +76,8 @@ def test_profile_run_without_metadata(dist_env) -> None:    # noqa: F811
     x = torch.randn(64, 5120, device=DEV).half()
     pos = torch.arange(64, device=DEV)
     before = {n: c.tensor.clone() for n, c in st.sim.caches.items()}
-    with override_forward_context(ForwardContext(no_compile_layers=st.ctx, attn_metadata=None, slot_mapping={})):
+    with override_forward_context(ForwardContext(no_compile_layers=st.ctx, attn_metadata=None, slot_mapping={},
+                                                 is_dummy_run=True)):
         for i in group:
             y = st.attn[i](pos, x)
             assert y.shape == (64, 5120) and torch.isfinite(y).all()

@@ -29,8 +29,10 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear, ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.models.deepseek_v41.common.contracts import CKV_RECORD_DIM, HIDDEN, NORM_EPS
 from vllm.models.deepseek_v41.sm70.sparse import (
     STATE_ROW_DIM,
@@ -39,6 +41,7 @@ from vllm.models.deepseek_v41.sm70.sparse import (
     DS41StateBackend,
     DS41StateMetadata,
     state_cache_spec,
+    step_metadata,
 )
 
 
@@ -85,8 +88,8 @@ def mm_fp32_split(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 def compressed_metadata(name: str) -> DS41CompressedMetadata | None:
-    md = get_forward_context().attn_metadata
-    if not isinstance(md, dict):
+    md = step_metadata(name)
+    if md is None:                  # dummy/profile forward without metadata (ForwardContext.is_dummy_run)
         return None
     m = md.get(name)
     if m is None:
@@ -157,8 +160,8 @@ class DeepseekV41Compressor(nn.Module):
 
     def _state_metadata(self) -> DS41StateMetadata:
         assert self.state_cache is not None
-        md = get_forward_context().attn_metadata
-        m = md.get(self.state_cache.layer_name) if isinstance(md, dict) else None
+        md = step_metadata(self.state_cache.layer_name)
+        m = md.get(self.state_cache.layer_name) if md is not None else None
         if m is None:
             raise RuntimeError(f"no metadata for {self.state_cache.layer_name}")
         return cast(DS41StateMetadata, m)

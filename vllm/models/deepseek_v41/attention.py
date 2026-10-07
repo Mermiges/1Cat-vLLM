@@ -58,17 +58,22 @@ from vllm.models.deepseek_v41.common.contracts import (
     StagePlan,
 )
 from vllm.models.deepseek_v41.common.rope import apply_rope_torch, build_v41_rope
-from vllm.models.deepseek_v41.compressor import DeepseekV41Compressor, FP32RMSNorm, mm_fp32
+from vllm.models.deepseek_v41.compressor import (
+    DeepseekV41Compressor,
+    FP32RMSNorm,
+    mm_fp32,
+)
 from vllm.models.deepseek_v41.indexer import DeepseekV41Indexer, attn_impl
 from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 from vllm.models.deepseek_v41.sm70.sparse import (
+    DeepseekV41SM70SparseImpl,
     DS41CacheLayer,
     DS41CompressedBackend,
     DS41CompressedMetadata,
     DS41SWABackend,
     DS41SWAMetadata,
-    DeepseekV41SM70SparseImpl,
     compressed_cache_spec,
+    step_metadata,
     swa_cache_spec,
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import ckv_rope_qat_store
@@ -184,10 +189,10 @@ class DeepseekV41Attention(nn.Module):
         return out
 
     def attention_impl(self, x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor) -> None:
-        md_all = get_forward_context().attn_metadata
+        md_all = step_metadata(self.layer_name)
         w_qkv = _fp16_weight(self.fused_wqa_wkv, (Q_LORA + HEAD_DIM, HIDDEN), f"{self.prefix}.fused_wqa_wkv")
         w_qb = _fp16_weight(self.wq_b, (self.n_local_heads * HEAD_DIM, Q_LORA), f"{self.prefix}.wq_b")
-        if not isinstance(md_all, dict):
+        if md_all is None:              # dummy/profile forward without metadata (ForwardContext.is_dummy_run)
             self._profile_run(x, positions, out, w_qkv, w_qb)
             return
         swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])

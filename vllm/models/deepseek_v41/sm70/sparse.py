@@ -33,6 +33,7 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.common.contracts import (
@@ -162,6 +163,28 @@ class DS41CompressedMetadata(DS41BatchMetadata):
 @dataclass
 class DS41StateMetadata(DS41BatchMetadata):
     prev_slot: torch.Tensor = None         # [T] int64: state row of position p-1 when p completes a pair, else -1
+
+
+def step_metadata(site: str) -> dict[str, object] | None:
+    """The per-layer attention metadata of the current forward, or None for a dummy/profile forward without
+    metadata (the caller then runs its projections only and writes no cache).
+
+    Decided on ``ForwardContext.is_dummy_run`` (PORT_DESIGN §9 AM-2), never on the metadata's type alone:
+    a list (micro-batching / DBO) raises NotImplementedError, and None on a real step raises -- either would
+    otherwise zero the attention output and skip every cache write without a trace (rule 9)."""
+    ctx = get_forward_context()
+    md = ctx.attn_metadata
+    if isinstance(md, dict):
+        return md
+    if isinstance(md, list):
+        raise NotImplementedError(f"{site}: DeepSeek-V4.1 attention got per-ubatch (list) attention metadata; "
+                                  "micro-batching / DBO is not supported")
+    if md is None:
+        if ctx.is_dummy_run:
+            return None
+        raise RuntimeError(f"{site}: attn_metadata is None on a forward that is not a dummy/profile run "
+                           "(ForwardContext.is_dummy_run=False): refusing to skip attention and cache writes")
+    raise TypeError(f"{site}: unexpected attn_metadata type {type(md).__name__}")
 
 
 def _exact_seq_lens_cpu(cm: CommonAttentionMetadata) -> np.ndarray:

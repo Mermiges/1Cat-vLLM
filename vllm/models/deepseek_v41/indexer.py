@@ -24,10 +24,12 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.models.deepseek_v41 import knobs
-from vllm.models.deepseek_v41.common.candidate_blocks import apply_candidate_mask, select_candidate_blocks
+from vllm.models.deepseek_v41.common.candidate_blocks import (
+    apply_candidate_mask,
+    select_candidate_blocks,
+)
 from vllm.models.deepseek_v41.common.contracts import (
     CAND_ALL,
     CAND_BLOCK,
@@ -42,7 +44,6 @@ from vllm.models.deepseek_v41.common.contracts import (
     LayerTopology,
     SharedAttnBuffers,
 )
-from vllm.models.deepseek_v41.common.rope import DeepseekV41RotaryEmbedding
 from vllm.models.deepseek_v41.compressor import FP32RMSNorm, mm_fp32, mm_fp32_split
 from vllm.models.deepseek_v41.sm70.indexer_kernels import (
     index_k_rope_qat_store,
@@ -55,6 +56,7 @@ from vllm.models.deepseek_v41.sm70.sparse import (
     DS41CompressedBackend,
     DS41CompressedMetadata,
     index_k_cache_spec,
+    step_metadata,
 )
 from vllm.models.deepseek_v41.sm70.sparse_kernels import logical_to_rows
 
@@ -106,8 +108,8 @@ class DeepseekV41Indexer(nn.Module):
         return self.rotary_emb.cos_sin_cache
 
     def _metadata(self) -> DS41CompressedMetadata | None:
-        md = get_forward_context().attn_metadata
-        if not isinstance(md, dict):
+        md = step_metadata(self.k_cache_name)
+        if md is None:                  # dummy/profile forward without metadata (ForwardContext.is_dummy_run)
             return None
         m = md.get(self.k_cache_name)
         if m is None:
