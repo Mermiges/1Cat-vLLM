@@ -63,15 +63,28 @@ def _pp(
         torch.full(s, 7 if rank == 0 else 0, device="cuda", dtype=d) for s, d in schema
     ]
 
+    from types import SimpleNamespace
+
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+    coordinator = GroupCoordinator.__new__(GroupCoordinator)
+    coordinator.world_size = 2
+    coordinator.rank_in_group = rank
+    coordinator.ranks = [0, 1]
+    coordinator.use_cpu_custom_send_recv = False
+    coordinator.device_communicator = SimpleNamespace(pynccl_comm=pynccl)
+    payload = {str(i): t for i, t in enumerate(tensors)}
+
     def step() -> None:
         op = dist.isend if rank == 0 else dist.irecv
         if grouped == "pynccl":
-            pynccl.group_start()
-            try:
-                for t in tensors:
-                    (pynccl.send if rank == 0 else pynccl.recv)(t, 1 - rank)
-            finally:
-                pynccl.group_end()
+            work = (
+                coordinator.isend_tensor_dict_static(payload)
+                if rank == 0
+                else coordinator.irecv_tensor_dict_static(payload)
+            )
+            for w in work:
+                w.wait()
             return
         if grouped == "torch_batch":
             work = dist.batch_isend_irecv(

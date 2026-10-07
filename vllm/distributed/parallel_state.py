@@ -1305,6 +1305,28 @@ class GroupCoordinator:
 
         return handles
 
+    def _grouped_static_cuda_transfer(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+        peer: int,
+        *,
+        send: bool,
+    ) -> list[Handle] | None:
+        # CPU/mixed-device and one-tensor transfers retain their original path.
+        # Use the already initialized PyNccl communicator: Torch batched P2P
+        # needs all PP ranks at its first use, which a serial chain cannot do.
+        if len(tensor_dict) < 2 or not all(
+            isinstance(t, torch.Tensor) and t.is_cuda for t in tensor_dict.values()
+        ):
+            return None
+        communicator = getattr(self, "device_communicator", None)
+        pynccl = getattr(communicator, "pynccl_comm", None)
+        if pynccl is None or pynccl.disabled:
+            return None
+        from vllm.distributed.static_cuda_transfer import enqueue_static_cuda_transfer
+
+        return list(enqueue_static_cuda_transfer(pynccl, tensor_dict, peer, send=send))
+
     def isend_tensor_dict_static(
         self,
         tensor_dict: dict[str, torch.Tensor],
@@ -1325,6 +1347,9 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert 0 <= dst < self.world_size, f"Invalid dst rank ({dst})"
 
+        grouped = self._grouped_static_cuda_transfer(tensor_dict, dst, send=True)
+        if grouped is not None:
+            return grouped
         handles: list[Handle] = []
         for tensor in tensor_dict.values():
             if not isinstance(tensor, torch.Tensor):
@@ -1355,6 +1380,9 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert 0 <= src < self.world_size, f"Invalid src rank ({src})"
 
+        grouped = self._grouped_static_cuda_transfer(tensor_dict, src, send=False)
+        if grouped is not None:
+            return grouped
         handles: list[Handle] = []
         for tensor in tensor_dict.values():
             if not isinstance(tensor, torch.Tensor):
