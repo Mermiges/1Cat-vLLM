@@ -40,7 +40,7 @@ from .test_attn_harness import (
 )
 
 pytestmark = pytest.mark.sm70
-DEV = torch.device("cuda")
+DEV = torch.device("cuda")  # rank-local device (set_device) in TP tests
 
 
 @pytest.fixture
@@ -79,7 +79,8 @@ class Stage:
     """Attention layers of one (simulated) PP stage sharing SharedAttnBuffers and a static forward context."""
 
     def __init__(self, cfg, layer_ids, weights, *, stage: StagePlan | None = None, mirror: bool = False,
-                 max_model_len: int = 65536, max_tokens: int = 4096, num_blocks: int = 512, seed: int = 0):
+                 max_model_len: int = 65536, max_tokens: int = 4096, num_blocks: int = 512, seed: int = 0,
+                 tp_rank: int = 0, tp_size: int = 1):
         from vllm.models.deepseek_v41.attention import DeepseekV41Attention
         from vllm.models.deepseek_v41.kv_mirror import DeepseekV41KVSourceMirror
         self.cfg = cfg
@@ -92,7 +93,7 @@ class Stage:
                                                  self.shared) for i in self.layer_ids}
             self.mirror = DeepseekV41KVSourceMirror(self.vcfg, 20, self.shared) if mirror else None
         for i in self.layer_ids:
-            load_into_module(self.attn[i], weights[i])
+            load_into_module(self.attn[i], weights[i], tp_rank, tp_size)
         self.sim = SimKV(self.vcfg, DEV, num_blocks=num_blocks, seed=seed)
         self.sim.register_all()
         self.ctx = self.vcfg.compilation_config.static_forward_context
@@ -107,7 +108,10 @@ class Stage:
 
         def wrapped(x, positions):
             latent, lpos = fwd(x, positions)
-            md = get_forward_context().attn_metadata[comp.attn_prefix]
+            md_all = get_forward_context().attn_metadata
+            if not isinstance(md_all, dict):          # profile / dummy run
+                return latent, lpos
+            md = md_all[comp.attn_prefix]
             req_of = md.token_to_req_indices.index_select(0, md.latent_token_idx).tolist()
             for k, ridx in enumerate(req_of):
                 req = self._batch[ridx][0]
@@ -171,12 +175,14 @@ def _overlap(port: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
     return float(np.mean(vals)), float(np.min(vals))
 
 
-def run_and_compare(cfg, layer_ids, weights, S: int, seed: int, two_requests: bool = True) -> dict:
-    st = Stage(cfg, layer_ids, weights, seed=seed)
+def run_and_compare(cfg, layer_ids, weights, S: int, seed: int, two_requests: bool = True,
+                    tp_rank: int = 0, tp_size: int = 1, capture: dict | None = None) -> dict:
+    st = Stage(cfg, layer_ids, weights, seed=seed, tp_rank=tp_rank, tp_size=tp_size)
     reqs = ["a", "b"] if two_requests else ["a"]
-    inputs = {i: {r: layer_inputs(weights[i], S, seed=1000 * i + k + seed, device=DEV) for k, r in enumerate(reqs)}
+    dev = torch.device("cuda", torch.cuda.current_device())
+    inputs = {i: {r: layer_inputs(weights[i], S, seed=1000 * i + k + seed, device=dev) for k, r in enumerate(reqs)}
               for i in layer_ids}
-    outs = {i: {r: torch.full((S, 5120), float("nan"), device=DEV) for r in reqs} for i in layer_ids}
+    outs = {i: {r: torch.full((S, 5120), float("nan"), device=dev) for r in reqs} for i in layer_ids}
     sched = {r: _schedule(S, seed + k) for k, r in enumerate(reqs)}
     progress = {r: 0 for r in reqs}
     ptr = {r: 0 for r in reqs}
@@ -191,6 +197,12 @@ def run_and_compare(cfg, layer_ids, weights, S: int, seed: int, two_requests: bo
         for r, s, n in batch:
             progress[r] += n
             ptr[r] += 1
+    if capture is not None:
+        for i in layer_ids:
+            for r in reqs:
+                capture[("out", i, r)] = outs[i][r]
+                if topology(cfg, i).compress_ratio:
+                    capture[("topk", i, r)] = _gather(st.rec[("topk", i, r)], S)
     # reference over whole sequences
     metrics: dict = {}
     for r in reqs:

@@ -250,16 +250,19 @@ def synthetic_attn_weights(cfg: SimpleNamespace, topo: LayerTopology, device: to
     return {k: v.to(device) for k, v in w.items()}
 
 
-def load_into_module(attn, w: dict[str, torch.Tensor]) -> None:
-    """Copy reference-named FP32 weights into a DeepseekV41Attention (TP1) the way L-CORE's loader maps them
-    (PORT_DESIGN §3.7)."""
+def load_into_module(attn, w: dict[str, torch.Tensor], tp_rank: int = 0, tp_size: int = 1) -> None:
+    """Copy reference-named FP32 weights into a DeepseekV41Attention the way L-CORE's loader maps them
+    (PORT_DESIGN §3.7): wq_b rows = local heads, wo_a rows = local o-groups, wo_b cols = local o-groups,
+    attn_sink through its TP weight loader; everything else replicated."""
+    hq = 64 // tp_size * 512
+    ga = 8 // tp_size * 1024
     with torch.no_grad():
         attn.fused_wqa_wkv.weight.copy_(torch.cat([w["attn.wq_a.weight"], w["attn.wkv.weight"]]).half())
         attn.q_norm.weight.copy_(w["attn.q_norm.weight"])
         attn.kv_norm.weight.copy_(w["attn.kv_norm.weight"])
-        attn.wq_b.weight.copy_(w["attn.wq_b.weight"].half())
-        attn.wo_a.weight.copy_(w["attn.wo_a.weight"].half())
-        attn.wo_b.weight.copy_(w["attn.wo_b.weight"].half())
+        attn.wq_b.weight.copy_(w["attn.wq_b.weight"][tp_rank * hq:(tp_rank + 1) * hq].half())
+        attn.wo_a.weight.copy_(w["attn.wo_a.weight"][tp_rank * ga:(tp_rank + 1) * ga].half())
+        attn.wo_b.weight.copy_(w["attn.wo_b.weight"][:, tp_rank * ga:(tp_rank + 1) * ga].half())
         attn._load_attn_sink(attn.attn_sink, w["attn.attn_sink"])
         if attn.compressor is not None:
             c = attn.compressor
