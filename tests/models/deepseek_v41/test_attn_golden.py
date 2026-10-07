@@ -210,12 +210,12 @@ def test_golden_per_op(dist_env, weights_cache, prompt: str, layer: int) -> None
                 report.setdefault("score", []).append(rel_rms(sc[~beyond], gs[~beyond]))
             if not stale:
                 # per-op indexer: golden attn.x (weights_proj), attn.qr, K -> port q GEMM/RoPE/QAT, scores, top-k
-                from vllm.models.deepseek_v41.compressor import mm_fp32, mm_fp32_split
+                from vllm.models.deepseek_v41.compressor import mm_fp32, mm_fp32_full
                 from vllm.models.deepseek_v41.sm70.indexer_kernels import (
                     index_q_rope_qat,
                 )
                 ix = attn.indexer
-                pq = mm_fp32_split(g("attn.qr"), ix.wq_b.weight).view(T, 32, 128)
+                pq = mm_fp32_full(g("attn.qr"), ix.wq_b.weight).view(T, 32, 128)
                 pq = index_q_rope_qat(pq, pos, attn.rotary_emb.cos_sin_cache)
                 pw = mm_fp32(g("attn.x").half(), ix.weights_proj.weight) * (128 ** -0.5 * 32 ** -0.5)
                 ps = torch.empty(T, n, device=DEV)
@@ -248,7 +248,7 @@ def test_golden_per_op(dist_env, weights_cache, prompt: str, layer: int) -> None
     assert max(report["kv_win_mismatch_x32"]) == 0.0, report       # bitwise window-KV records (MC-ATTN F4)
     assert max(report["kv_win_mismatch_x16"]) <= 0.03, report      # measured <= 2.2 % (FP16 input rounding)
     if "idx_q_mismatch" in report:
-        assert max(report["idx_q_mismatch"]) <= 1e-4, report        # FP4 q from golden attn.qr (split-FP16 GEMM)
+        assert max(report["idx_q_mismatch"]) == 0.0, report         # FP4 q from golden attn.qr (FP32 SGEMM): bitwise
     if "score" in report:
         assert max(report["score"]) <= 1e-3, report
         assert min(report["topk_same_set_from_golden_scores"]) >= 0.99, report
@@ -270,7 +270,7 @@ def test_golden_long_candidates_and_indexer(dist_env, weights_cache, phase: str)
     indexer gates. Both layers also run the port indexer end to end from golden inputs: layer-20 candidate blocks
     from PORT scores vs golden (reported + >= 99.9 % mean overlap)."""
     from vllm.models.deepseek_v41.common.candidate_blocks import apply_candidate_mask
-    from vllm.models.deepseek_v41.compressor import mm_fp32, mm_fp32_split
+    from vllm.models.deepseek_v41.compressor import mm_fp32, mm_fp32_full
     from vllm.models.deepseek_v41.sm70.indexer_kernels import index_q_rope_qat
 
     d = _case_dir(LONG_PROMPT, phase)
@@ -333,7 +333,7 @@ def test_golden_long_candidates_and_indexer(dist_env, weights_cache, phase: str)
     # (4) the port's indexer from golden inputs (attn.qr FP32, attn.x, layer-20 K): q, scores, candidates, top-k
     for i, g in ((20, g20), (24, g24)):
         ix = Stage(cfg, (i,), {i: _weights(weights_cache, i)}).attn[i].indexer
-        pq = index_q_rope_qat(mm_fp32_split(g("attn.qr"), ix.wq_b.weight).view(R, 32, 128), pos, rope)
+        pq = index_q_rope_qat(mm_fp32_full(g("attn.qr"), ix.wq_b.weight).view(R, 32, 128), pos, rope)
         report[f"l{i}_idx_q_mismatch"] = float((pq.float() != g("idx.q")).float().mean())
         pw = mm_fp32(g("attn.x").half(), ix.weights_proj.weight) * (128 ** -0.5 * 32 ** -0.5)
         ps = torch.empty(R, n, device=DEV)
@@ -358,7 +358,7 @@ def test_golden_long_candidates_and_indexer(dist_env, weights_cache, phase: str)
     print(LONG_PROMPT, phase, {k: round(v, 7) if isinstance(v, float) else v for k, v in report.items()})
     assert report["l20_score"] <= 1e-3, report
     for i in (20, 24):
-        assert report[f"l{i}_idx_q_mismatch"] <= 1e-4, report
+        assert report[f"l{i}_idx_q_mismatch"] == 0.0, report       # FP32 SGEMM q: bitwise vs golden
         assert report[f"l{i}_score_port_q"] <= 1e-3, report
         assert report[f"l{i}_topk_port_mean"] >= 0.995 and report[f"l{i}_topk_port_min"] >= 0.98, report
     assert report["l20_cand_port_mean"] >= 0.999, report
