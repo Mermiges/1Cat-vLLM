@@ -69,12 +69,17 @@ def test_long_context_candidates_real_weights(dist_env) -> None:    # noqa: F811
             m["cand_mean"], m["cand_min"], m["cand_rows"] = float(np.mean(ov)), float(np.min(ov)), len(ov)
     print(report)
     for i, m in report.items():
-        # tokens with the reference's exact top-512 set are at the numerical floor; the rest differ by near-tie
-        # picks among up to 20K candidates (FP4-QAT discontinuities), which dominates the composite error
+        # Port and reference get the same FP16 inputs here. Rows whose top-512 set equals the reference's are at the
+        # §4.5 sparse-attention gate (measured <= 9.2e-4). The other ~3 % of rows differ by 1-6 near-tie indexer picks
+        # among up to 20K entries (FP4 QAT discontinuities); a swapped key can carry a large ATTENTION weight even
+        # though its INDEXER score was a near-tie, so those rows dominate the composite (measured 7.5e-3..1.23e-2).
+        # The composite is not a §4.5 metric; it is bounded at 2e-2 and the share of such rows is gated.
         assert m["out_same_topk"] <= 2e-3, (i, m)
+        assert m["frac_same_topk"] >= 0.95, (i, m)                     # measured >= 96.7 %
         assert m["out"] <= 2e-2, (i, m)
-        assert m["topk_mean"] >= 0.995 and m["topk_min"] >= 0.97, (i, m)
-    assert report[20]["cand_rows"] > 20 and report[20]["cand_mean"] >= 0.99, report[20]
+        assert m["topk_mean"] >= 0.995 and m["topk_min"] >= 0.98, (i, m)  # §4.5 indexer gate (measured min 98.8 %)
+    c = report[20]
+    assert c["cand_rows"] > 20 and c["cand_mean"] >= 0.999 and c["cand_min"] >= 0.99, c   # measured 99.999 / 99.95 %
 
 
 def _compare(cfg, layers, weights, inputs, outs, req, lo, hi, gate=1e-2):

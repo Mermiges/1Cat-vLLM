@@ -37,7 +37,14 @@ from vllm.models.deepseek_v41.sm70.indexer_kernels import index_scores, topk_sor
 from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 from vllm.models.deepseek_v41.sm70.sparse_kernels import sparse_attention
 
-from .test_attn_harness import load_attn_weights, ref_config, rel_rms, topology
+from .test_attn_harness import (
+    RefState,
+    load_attn_weights,
+    ref_attention,
+    ref_config,
+    rel_rms,
+    topology,
+)
 from .test_attn_layers import DEV, Stage, _overlap, dist_env  # noqa: F401  (fixture)
 
 pytestmark = [pytest.mark.sm70, pytest.mark.weights]
@@ -382,38 +389,63 @@ def test_golden_layer_end_to_end(dist_env, weights_cache, prompt: str, group) ->
     for n in chunks:
         st.step([("a", pos, n)], inputs, outs)
         pos += n
+    # Three links (MC-ATTN F3; evidence /mnt/nvme2/scratch/ds41/attn/f3f4/f3_probe_*.json):
+    #   golden ~ ref32: the harness's FP32 reference fed the golden's FP32 attn.x reproduces the golden (<= 2.4e-4)
+    #     except on STALE rows -- ratio-2 decode steps completing no pair, where the official reference scores
+    #     against another layer's index-K (finding in L-ATTN.progress.md); those rows are excluded everywhere.
+    #   ref16: the same reference fed the FP16-rounded attn.x the port receives (§4.1 FP16 sublayer inputs). Its
+    #     distance to the golden (<= 5.2e-3 out, top-512 min down to 97.85 % at layer 24 / p3_doc) is the
+    #     input-rounding floor: FP8/FP4 QAT flips and near-tie top-k picks, identical for the port.
+    #   port ~ ref16 at the §4.5 per-op gates: out <= 2e-3, top-512 >= 99.5 % mean / >= 98 % min, latent <= 1e-3.
+    ref32_state, ref16_state = RefState(), RefState()
     report: dict = {}
     for i in group:
         topo = topology(cfg, i)
+        m = report.setdefault(i, {})
+        x32 = torch.cat([c.get(i, "attn.x") for c in cases])
+        rec32: dict = {}
+        rec16: dict = {}
+        ref32 = ref_attention(cfg, topo, weights[i], x32, ref32_state, record=rec32)
+        ref16 = ref_attention(cfg, topo, weights[i], x32.half(), ref16_state, record=rec16)
         golden_out = torch.cat([c.get(i, "attn.out") for c in cases])
-        report.setdefault(i, {})["out"] = rel_rms(outs[i]["a"], golden_out)
-        if topo.owns_indexer or topo.compress_ratio:
-            if all(c.has(i, "idx.topk") for c in cases) or all(
-                    c.has(topo.index_source, "idx.topk") for c in cases):
-                src = i if cases[0].has(i, "idx.topk") else topo.index_source
-                gtk = torch.cat([c.get(src, "idx.topk") for c in cases]).long()
-                ptk = torch.cat([st.rec[("topk", i, "a")][k] for k in sorted(st.rec[("topk", i, "a")])]).long()
-                keep = torch.ones(gtk.shape[0], dtype=torch.bool)
-                if topo.compress_ratio == 2:
-                    # decode rows where the official reference scored against a stale index_k (see per-op test)
-                    for k, c in enumerate(cases[1:]):
-                        if (c.start + 1) % 2 != 0:
-                            keep[T0 + k] = False
-                mean, mn = _overlap(ptk[keep], gtk[keep])
-                report[i]["topk_mean"], report[i]["topk_min"] = mean, mn
-                report[i]["stale_rows_excluded"] = int((~keep).sum())
+        port_out = outs[i]["a"]
+        keep = torch.ones(S, dtype=torch.bool, device=DEV)
+        if topo.compress_ratio == 2:
+            for k, c in enumerate(cases[1:]):
+                if (c.start + 1) % 2 != 0:
+                    keep[T0 + k] = False
+        m["stale_rows_excluded"] = int((~keep).sum())
+        m["out_ref32_golden"] = rel_rms(ref32[keep], golden_out[keep])
+        m["out_ref16_golden"] = rel_rms(ref16[keep], golden_out[keep])
+        m["out_port_golden"] = rel_rms(port_out[keep], golden_out[keep])
+        m["out_port_ref16"] = rel_rms(port_out, ref16)
+        if topo.compress_ratio:
+            src = i if cases[0].has(i, "idx.topk") else topo.index_source
+            ptk = torch.cat([st.rec[("topk", i, "a")][k] for k in sorted(st.rec[("topk", i, "a")])]).long()
+            kc = keep.cpu()
+            m["topk_port_ref16"] = _overlap(ptk, rec16["idx.topk"].long().cpu())
+            if all(c.has(src, "idx.topk") for c in cases):
+                gtk = torch.cat([c.get(src, "idx.topk") for c in cases]).long().cpu()
+                m["topk_ref16_golden"] = _overlap(rec16["idx.topk"].long().cpu()[kc], gtk[kc])
+                m["topk_port_golden"] = _overlap(ptk.cpu()[kc], gtk[kc])
         if topo.owns_compressor and cases[0].has(i, "attn.latent"):
             lat = st.rec[("latent", i, "a")]
-            gl = [c.get(i, "attn.latent") for c in cases if c.has(i, "attn.latent")]
-            gl = torch.cat(gl)
+            gl = torch.cat([c.get(i, "attn.latent") for c in cases if c.has(i, "attn.latent")])
             port = torch.stack([lat[p] for p in sorted(lat)])[: gl.shape[0]]
-            report[i]["latent"] = rel_rms(port, gl)
+            m["latent_port_golden"] = rel_rms(port, gl)
+            m["latent_port_ref16"] = rel_rms(port, rec16["attn.latent"][: gl.shape[0]])
     print(prompt, group, report)
     for i, m in report.items():
-        assert m["out"] <= 1e-2, (i, m)
-        if "topk_mean" in m:
-            # composite: keys come from the port's own compressor/write_keys fed FP16 attn.x (PORT_DESIGN §4.1 FP16
-            # sublayer inputs); the strict §4.5 indexer gate (min 98 %) is enforced by test_golden_per_op
-            assert m["topk_mean"] >= 0.995 and m["topk_min"] >= 0.97, (i, m)
-        if "latent" in m:
-            assert m["latent"] <= 1e-3, (i, m)
+        assert m["out_ref32_golden"] <= 1e-3, (i, m)                 # the reference is faithful to the golden
+        assert m["out_port_ref16"] <= 2e-3, (i, m)                   # §4.5 (measured <= 5.8e-4)
+        # vs golden the port adds no more than 2e-4 to the input-rounding floor (measured <= 5e-5)
+        assert m["out_port_golden"] <= m["out_ref16_golden"] + 2e-4 and m["out_port_golden"] <= 6e-3, (i, m)
+        if "topk_port_ref16" in m:
+            mean, mn = m["topk_port_ref16"]
+            assert mean >= 0.995 and mn >= 0.98, (i, m)               # §4.5 indexer gate
+        if "topk_port_golden" in m:
+            # no worse than the FP32 reference given the same FP16 input, within 2 of 512 picks
+            assert m["topk_port_golden"][0] >= 0.995, (i, m)
+            assert m["topk_port_golden"][1] >= m["topk_ref16_golden"][1] - 2 / 512, (i, m)
+        if "latent_port_golden" in m:
+            assert m["latent_port_golden"] <= 1e-3 and m["latent_port_ref16"] <= 1e-3, (i, m)
