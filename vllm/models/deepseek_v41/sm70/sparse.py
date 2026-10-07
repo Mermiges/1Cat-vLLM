@@ -202,10 +202,15 @@ DECODE_PATH_ENV = "VLLM_DS41_ATTN_DECODE_PATH"
 
 
 def decode_path_enabled() -> bool:
-    """SM70 decode uses graph-safe metadata by default; the torch oracle uses general metadata."""
+    """SM70 graph-safe decode metadata is OPT-IN (VLLM_DS41_ATTN_DECODE_PATH=1).
+
+    Default OFF since 2026-10-07 (D31): the 12-GPU end-to-end run hung after ~17 tokens with it on (root cause
+    open, SOL-FIX.progress.md); with it off attention runs as an eager break inside the breakable decode graphs,
+    the configuration validated end to end (E2E_FINAL.md). The torch oracle always uses general metadata.
+    """
     if knobs.env_str("VLLM_DS41_ATTN_IMPL", "sm70", choices=("sm70", "torch")) == "torch":
         return False
-    return knobs.env_bool(DECODE_PATH_ENV, True)
+    return knobs.env_bool(DECODE_PATH_ENV, False)
 
 
 def _exact_seq_lens_cpu(cm: CommonAttentionMetadata) -> np.ndarray:

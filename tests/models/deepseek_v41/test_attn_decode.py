@@ -54,7 +54,7 @@ def test_decode_default_and_explicit_overrides(monkeypatch) -> None:
 
     monkeypatch.delenv(DECODE_PATH_ENV, raising=False)
     monkeypatch.setenv("VLLM_DS41_ATTN_IMPL", "sm70")
-    assert decode_path_enabled()
+    assert not decode_path_enabled()  # default OFF since D31 (opt-in)
     monkeypatch.setenv(DECODE_PATH_ENV, "0")
     assert not decode_path_enabled()
     monkeypatch.setenv(DECODE_PATH_ENV, "1")
