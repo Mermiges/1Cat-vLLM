@@ -61,15 +61,16 @@ def test_rows_in_place_equal_safetensors(hf_config, monkeypatch: pytest.MonkeyPa
     with safe_open(str(shard), framework="pt") as f:
         w = f.get_slice(f"layers.{layer}.engram.embed.weight")
         sc = f.get_slice(f"layers.{layer}.engram.embed.scale")
+        per = n_rand // 6
         for rank in range(4):
-            svc = EngramHostService(hf_config, (layer,), rank, 4, str(ENGRAM_DIR), tokenizer_path(), 64,
+            # staging sized for the direct gather below: (per + 2) tokens x 6 sub-tables
+            svc = EngramHostService(hf_config, (layer,), rank, 4, str(ENGRAM_DIR), tokenizer_path(), per + 2,
                                     torch.device("cuda"), io_threads=4)
             try:
                 loc = locate_engram_tables(str(ENGRAM_DIR), svc.layout, (layer,))[0]
                 assert loc.weight_offset == {1: 664, 14: 672}[layer]
                 # random ids of each owned sub-table (incl. both ends of every bucket range)
                 li = svc.layout.layer_index(layer)
-                per = n_rand // svc.n_sub
                 rows = np.empty((per + 2, 1, svc.n_sub), np.int64)
                 for j, s in enumerate(svc.subtables):
                     lo, n = svc.layout.offsets[li][s], svc.layout.primes[li][s]

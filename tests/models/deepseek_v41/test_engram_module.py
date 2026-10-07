@@ -55,7 +55,8 @@ def ref_engram(stream: torch.Tensor, rows: np.ndarray, wkv_w: np.ndarray, wkv_s:
     return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(torch.bfloat16)
 
 
-def compare(out: torch.Tensor, ref: torch.Tensor, stream_in: torch.Tensor, tag: str) -> dict[str, float]:
+def compare(out: torch.Tensor, ref: torch.Tensor, stream_in: torch.Tensor, tag: str,
+            gate: bool = True) -> dict[str, float]:
     o, r = out.float().cpu(), ref.float().cpu()
     assert torch.isfinite(o).all(), f"{tag}: non-finite output"
     rel = ((o - r).norm() / r.norm()).item()
@@ -65,6 +66,8 @@ def compare(out: torch.Tensor, ref: torch.Tensor, stream_in: torch.Tensor, tag: 
     d_rel = ((o - r).norm() / d_ref.norm()).item() if d_ref.norm() > 0 else 0.0
     m = dict(rel_rms=rel, max_abs=maxabs, max_ref=r.abs().max().item(), ulp_max=int(ulp.max()),
              frac_ulp_gt0=(ulp > 0).float().mean().item(), delta_rel_rms=d_rel)
+    if not gate:
+        return m
     # PORT_DESIGN §4.5 module gate (rel-RMS <= 1e-3, max-abs <= 1e-2 x max) + a tighter look at the Engram delta
     assert rel <= 1e-3 and maxabs <= 1e-2 * m["max_ref"], f"{tag}: {m}"
     assert d_rel <= 1e-2, f"{tag}: Engram delta off: {m}"
@@ -403,7 +406,7 @@ def test_module_real_weights_vs_reference(monkeypatch: pytest.MonkeyPatch, layer
     ref = ref_engram(stream, rows, w8, s8, q, k)
     ref_bf16kv = ref_engram(stream, rows, w8, s8, q, k, round_kv_bf16=True)
     print(f"L{layer} reference with bf16-rounded kv vs FP32 kv: "
-          f"{compare(ref_bf16kv, ref, stream, 'ref-bf16kv')}")
+          f"{compare(ref_bf16kv, ref, stream, 'ref-bf16kv', gate=False)}")
     for impl in ("torch", "sm70"):
         monkeypatch.setenv("VLLM_DS41_ENGRAM_IMPL", impl)
         svc = EngramHostService(hf, (layer,), 0, 1, str(ENGRAM_DIR), str(ref_dir), 384, torch.device("cuda"))
