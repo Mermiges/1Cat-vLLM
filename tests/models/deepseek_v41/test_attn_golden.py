@@ -32,6 +32,7 @@ import torch
 
 from vllm.models.deepseek_v41.common.candidate_blocks import select_candidate_blocks
 from vllm.models.deepseek_v41.common.contracts import CAND_ALL
+from vllm.models.deepseek_v41.common.rope import build_v41_rope
 from vllm.models.deepseek_v41.sm70.indexer_kernels import index_scores, topk_sorted
 from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 from vllm.models.deepseek_v41.sm70.sparse_kernels import sparse_attention
@@ -203,7 +204,9 @@ def test_golden_per_op(dist_env, weights_cache, prompt: str, layer: int) -> None
             if not stale:
                 # per-op indexer: golden attn.x (weights_proj), attn.qr, K -> port q GEMM/RoPE/QAT, scores, top-k
                 from vllm.models.deepseek_v41.compressor import mm_fp32, mm_fp32_split
-                from vllm.models.deepseek_v41.sm70.indexer_kernels import index_q_rope_qat
+                from vllm.models.deepseek_v41.sm70.indexer_kernels import (
+                    index_q_rope_qat,
+                )
                 ix = attn.indexer
                 pq = mm_fp32_split(g("attn.qr"), ix.wq_b.weight).view(T, 32, 128)
                 pq = index_q_rope_qat(pq, pos, attn.rotary_emb.cos_sin_cache)
@@ -245,6 +248,113 @@ def test_golden_per_op(dist_env, weights_cache, prompt: str, layer: int) -> None
     if "score_port_q" in report:
         assert max(report["score_port_q"]) <= 1e-3, report
         assert min(report["topk_port_mean"]) >= 0.995 and min(report["topk_port_min"]) >= 0.98, report
+
+
+# ------------------------------------------------------------------------------------------- long context (> 16K)
+LONG_PROMPT = "p4_long"
+
+
+@pytest.mark.parametrize("phase", ("prefill", "decode1"))
+def test_golden_long_candidates_and_indexer(dist_env, weights_cache, phase: str) -> None:    # noqa: F811
+    """p4_long (24,600-token prompt, layers 20 + 24 captured; MC-ATTN F5): the candidate path beyond 16,384 tokens.
+    Layer 20 (candidate source): scores from golden q/w/K, candidate blocks from golden scores (100 % set equality,
+    §4.5). Layer 24 (Reindex): the port's candidate mask on golden scores == golden cand.mask, top-512 from the
+    masked golden scores == golden; the port's own indexer (golden attn.qr / attn.x, layer-20 K) at the §4.5
+    indexer gates. Both layers also run the port indexer end to end from golden inputs: layer-20 candidate blocks
+    from PORT scores vs golden (reported + >= 99.9 % mean overlap)."""
+    from vllm.models.deepseek_v41.common.candidate_blocks import apply_candidate_mask
+    from vllm.models.deepseek_v41.compressor import mm_fp32, mm_fp32_split
+    from vllm.models.deepseek_v41.sm70.indexer_kernels import index_q_rope_qat
+
+    d = _case_dir(LONG_PROMPT, phase)
+    if d is None:
+        pytest.skip(f"no {MODE} golden for {LONG_PROMPT}/{phase} under {ROOT}")
+    case = Case(d)
+    if not {20, 24} <= case.captured:
+        pytest.skip(f"{d} did not capture layers 20 and 24")
+    cfg = ref_config()
+    for i in (20, 24):
+        assert topology(cfg, i).compress_ratio == 1
+    T, start = case.num_tokens, case.start
+    subset = case.manifest.get("row_subset")
+    rows = torch.tensor(subset["rows"], device=DEV) if subset else torch.arange(T, device=DEV)
+    pos = start + rows
+    ends = pos + 1                                                  # ratio 1: one entry per token
+    R = rows.numel()
+    g20 = lambda n: case.get(20, n)                                 # noqa: E731
+    g24 = lambda n: case.get(24, n)                                 # noqa: E731
+    s20, s24 = g20("idx.score"), g24("idx.score")
+    n = s20.shape[1]
+    vis = torch.arange(n, device=DEV)[None, :] < ends[:, None]
+    assert torch.equal(torch.isneginf(s20), ~vis) and torch.equal(torch.isneginf(s24), ~vis)
+    keys = g20("cache.ik")[:n].half().contiguous()
+    rope = build_v41_rope(cfg, 1, max_positions=start + T + 1, device=DEV).cos_sin_cache
+    report: dict = {"rows": R}
+
+    # (1) layer-20 scores from golden q / w / K
+    sc = torch.empty(R, n, device=DEV)
+    index_scores(g20("idx.q").half().contiguous(), g20("idx.w"), keys, sc)
+    report["l20_score"] = rel_rms(sc[vis], s20[vis])
+
+    # (2) candidate blocks from golden layer-20 scores: set equality per row (CAND_ALL rows: every visible block)
+    cand = torch.empty(R, 2048, dtype=torch.int32, device=DEV)
+    select_candidate_blocks(s20.clone(), ends, 2048, 8, cand)
+    gcb = g20("cand.blocks").long()
+    real = 0
+    for r in range(R):
+        want = set(gcb[r].tolist()) - {-1}
+        if cand[r, 0].item() == CAND_ALL:
+            assert want == set(range((int(ends[r]) + 7) // 8)), f"row {r}: CAND_ALL vs golden"
+        else:
+            real += 1
+            assert set(cand[r].tolist()) - {-1} == want, f"row {r}: candidate blocks differ"
+    report["cand_real_rows"] = real
+    assert real > 0, "p4_long must exercise real candidate blocks (rows beyond 16,384 + 8 tokens)"
+
+    # (3) layer-24 mask from those candidates == golden cand.mask (& causal); finite scores untouched
+    m24 = s24.clone()
+    apply_candidate_mask(m24, ends, cand, 8)
+    assert torch.equal(torch.isneginf(m24), ~(g20("cand.mask").bool() & vis)), "candidate mask != golden"
+    fin = torch.isfinite(m24)
+    assert torch.equal(m24[fin], s24[fin])
+    gtk24 = g24("idx.topk").long()
+    same = [set(a) - {-1} == set(b) - {-1} for a, b in zip(topk_sorted(m24, ends, 512).long().tolist(),
+                                                           gtk24.tolist())]
+    report["l24_topk_same_set_from_golden_scores"] = float(np.mean(same))
+    assert report["l24_topk_same_set_from_golden_scores"] >= 0.999, report
+
+    # (4) the port's indexer from golden inputs (attn.qr FP32, attn.x, layer-20 K): q, scores, candidates, top-k
+    for i, g in ((20, g20), (24, g24)):
+        ix = Stage(cfg, (i,), {i: _weights(weights_cache, i)}).attn[i].indexer
+        pq = index_q_rope_qat(mm_fp32_split(g("attn.qr"), ix.wq_b.weight).view(R, 32, 128), pos, rope)
+        report[f"l{i}_idx_q_mismatch"] = float((pq.float() != g("idx.q")).float().mean())
+        pw = mm_fp32(g("attn.x").half(), ix.weights_proj.weight) * (128 ** -0.5 * 32 ** -0.5)
+        ps = torch.empty(R, n, device=DEV)
+        index_scores(pq, pw, keys, ps)
+        ps.masked_fill_(~vis, float("-inf"))
+        report[f"l{i}_score_port_q"] = rel_rms(ps[vis], g("idx.score")[vis])
+        if i == 20:
+            pc = torch.empty(R, 2048, dtype=torch.int32, device=DEV)
+            select_candidate_blocks(ps.clone(), ends, 2048, 8, pc)
+            ov = []
+            for r in range(R):
+                want = set(gcb[r].tolist()) - {-1}
+                got = (set(range((int(ends[r]) + 7) // 8)) if pc[r, 0].item() == CAND_ALL
+                       else set(pc[r].tolist()) - {-1})
+                ov.append(len(got & want) / len(want))
+            report["l20_cand_port_mean"], report["l20_cand_port_min"] = float(np.mean(ov)), float(np.min(ov))
+            port_cand = pc
+        else:
+            apply_candidate_mask(ps, ends, port_cand, 8)
+        mean, mn = _overlap(topk_sorted(ps, ends, 512).long(), g("idx.topk").long())
+        report[f"l{i}_topk_port_mean"], report[f"l{i}_topk_port_min"] = mean, mn
+    print(LONG_PROMPT, phase, {k: round(v, 7) if isinstance(v, float) else v for k, v in report.items()})
+    assert report["l20_score"] <= 1e-3, report
+    for i in (20, 24):
+        assert report[f"l{i}_idx_q_mismatch"] <= 1e-4, report
+        assert report[f"l{i}_score_port_q"] <= 1e-3, report
+        assert report[f"l{i}_topk_port_mean"] >= 0.995 and report[f"l{i}_topk_port_min"] >= 0.98, report
+    assert report["l20_cand_port_mean"] >= 0.999, report
 
 
 # ------------------------------------------------------------------------------------------------ end to end
