@@ -450,6 +450,13 @@ class CustomAllreduce:
         If registered is True, this assumes inp's pointer is already
         IPC-registered. Otherwise, inp is first copied into a pre-registered
         buffer.
+
+        Default fully-connected SM70 TP4 decode FP16 sums ranks 0,1,2,3 in
+        FP32 and casts once, rather than NCCL's intermediate FP16 rounding.
+        FP32 packets below 512 KiB use the same canonical rank order. Larger
+        FP32 packets use two-stage reduction: output quarter q sums ranks
+        q,q+1,q+2,q+3 modulo four, then gathers the already reduced quarters.
+        Grid tuning preserves these orders; NCCL bit equality is not implied.
         """
         if out is None:
             out = torch.empty_like(inp)
