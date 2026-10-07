@@ -225,32 +225,100 @@ def test_malformed_dsml_is_never_a_tool_call(hf_tokenizer, text) -> None:
     assert not out.tools_called and out.tool_calls == [] and out.content == text
 
 
-def _stream(parser, text, step=3):
+EOS_ID = 1          # <｜end▁of▁sentence｜> in the V4.1 tokenizer (checked below)
+PARITY_CASES = {
+    "good": GOOD_597,
+    "good_eos_text": GOOD_597 + "<｜end▁of▁sentence｜>",
+    "good_ws_tail": GOOD_597 + "\n ",
+    "corrupt_597": CORRUPT_597,
+    "stray_name_597": STRAY_NAME_597,
+    "v4_unspaced": GOOD_597.replace("｜DSML｜ ", "｜DSML｜").replace("｜DSML｜calls", "｜DSML｜tool_calls"),
+    "wrong_tool": GOOD_597.replace("read_file", "write_file"),
+    "bad_json": GOOD_597.replace('string="true">/etc/hostname', 'string="false">/etc/hostname'),
+    "unterminated": GOOD_597[:-len("</｜DSML｜ calls>")],
+    "unterminated_short": "Answer:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read_file\">\n",
+    "trailing_text": GOOD_597 + " trailing text",
+    "two_blocks": GOOD_597 + "\n\n" + GOOD_597[GOOD_597.index("<｜DSML｜ calls>"):],
+    "no_block": "Plain answer without tools.",
+    "trailing_blank_lines": "Hello world\n\n",
+    "partial_lead_at_end": "Hello\n\n<｜DSML｜",
+    "block_only": GOOD_597[GOOD_597.index("<｜DSML｜ calls>"):],
+}
+
+
+def _stream(parser, text, step, final_via="eos"):
     deltas, prev = [], ""
-    for i in range(step, len(text) + step, step):
+    cuts = list(range(step, len(text), step)) + [len(text)]
+    for k, i in enumerate(cuts):
         cur = text[:i]
-        d = parser.extract_tool_calls_streaming(prev, cur, cur[len(prev):], [], [], [],
+        last = k == len(cuts) - 1
+        ids = [EOS_ID] if last and final_via == "eos" else [7]
+        d = parser.extract_tool_calls_streaming(prev, cur, cur[len(prev):], [], [], ids,
                                                 SimpleNamespace(tools=[READ_FILE]))
         if d is not None:
             deltas.append(d)
         prev = cur
+    if final_via == "finish":
+        d = parser.finish_streaming(SimpleNamespace(tools=[READ_FILE]))
+        if d is not None:
+            deltas.append(d)
     return deltas
 
 
-@pytest.mark.parametrize("step", [1, 2, 5, 17])
-def test_streaming(hf_tokenizer, step) -> None:
+def test_eos_id(hf_tokenizer) -> None:
+    assert hf_tokenizer.eos_token_id == EOS_ID
+
+
+@pytest.mark.parametrize("final_via", ["eos", "finish"])
+@pytest.mark.parametrize("step", [1, 2, 3, 5, 17, 10_000])
+@pytest.mark.parametrize("case", sorted(PARITY_CASES))
+def test_streaming_matches_non_streaming(hf_tokenizer, case, step, final_via) -> None:
+    """MC-CORE F3: streaming reconstructs exactly what extract_tool_calls returns (content + calls)."""
+    text = PARITY_CASES[case]
+    ref = _tool_parser(hf_tokenizer, [READ_FILE]).extract_tool_calls(text, SimpleNamespace(tools=[READ_FILE]))
     parser = _tool_parser(hf_tokenizer, [READ_FILE])
-    deltas = _stream(parser, GOOD_597, step)
+    deltas = _stream(parser, text, step, final_via)
     content = "".join(d.content or "" for d in deltas)
     calls = [tc for d in deltas for tc in (d.tool_calls or [])]
-    assert content == GOOD_597[: GOOD_597.index("\n\n<｜DSML｜ calls>")]
-    assert len(calls) == 1 and calls[0].function.name == "read_file"
-    assert json.loads(calls[0].function.arguments) == {"path": "/etc/hostname"}
-    assert parser.prev_tool_call_arr[0]["arguments"] == parser.streamed_args_for_tool[0]
-    bad = _tool_parser(hf_tokenizer, [READ_FILE])
-    deltas = _stream(bad, CORRUPT_597, step)
-    assert "".join(d.content or "" for d in deltas) == CORRUPT_597
-    assert not any(d.tool_calls for d in deltas) and bad.prev_tool_call_arr == []
+    assert content == (ref.content or "")
+    assert [(c.function.name, json.loads(c.function.arguments)) for c in calls] == \
+        [(c.function.name, json.loads(c.function.arguments)) for c in ref.tool_calls]
+    if ref.tools_called:
+        assert [a["arguments"] for a in parser.prev_tool_call_arr] == parser.streamed_args_for_tool
+    else:
+        assert parser.prev_tool_call_arr == []
+
+
+@pytest.mark.parametrize("case", ["good", "unterminated", "trailing_blank_lines", "corrupt_597"])
+def test_delegating_parser_finish_hook(hf_tokenizer, case) -> None:
+    """A stream ending WITHOUT an EOS token (length / stop string) is finalised through parse_delta(finished=True)."""
+    from vllm.parser.abstract_parser import _WrappedParser
+    from vllm.tool_parsers.deepseekv41_engine_tool_parser import DeepSeekV41EngineToolParser
+
+    text = PARITY_CASES[case]
+    ref = _tool_parser(hf_tokenizer, [READ_FILE]).extract_tool_calls(text, SimpleNamespace(tools=[READ_FILE]))
+
+    class Wrapped(_WrappedParser):
+        reasoning_parser_cls = None
+        tool_parser_cls = DeepSeekV41EngineToolParser
+
+    parser = Wrapped(hf_tokenizer, [READ_FILE])
+    request = SimpleNamespace(tools=[READ_FILE], tool_choice="auto")
+    deltas = []
+    for i in range(0, len(text), 4):
+        last = i + 4 >= len(text)
+        d = parser.parse_delta(text[i: i + 4], [7], request, prompt_token_ids=[0], finished=last)
+        if d is not None:
+            deltas.append(d)
+    assert "".join(d.content or "" for d in deltas) == (ref.content or "")
+    assert len([tc for d in deltas for tc in (d.tool_calls or [])]) == len(ref.tool_calls)
+
+
+def test_expected_verdicts(hf_tokenizer) -> None:
+    called = {case for case, text in PARITY_CASES.items()
+              if _tool_parser(hf_tokenizer, [READ_FILE]).extract_tool_calls(
+                  text, SimpleNamespace(tools=[READ_FILE])).tools_called}
+    assert called == {"good", "good_eos_text", "good_ws_tail", "block_only"}
 
 
 def test_skip_special_tokens_disabled_for_tools(hf_tokenizer) -> None:

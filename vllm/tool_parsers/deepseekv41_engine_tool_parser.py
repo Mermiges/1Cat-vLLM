@@ -17,8 +17,9 @@ have; this parser runs on 1Cat's ``ToolParser`` base and parses with the OFFICIA
 reference accepts. It is strict on purpose (1Cat issue #597: V4 on SM70 emitted DSML with a missing ``<`` and
 stray characters inside parameter names): a block that does not parse, has non-JSON arguments, names an
 undeclared tool or an undeclared parameter is NOT turned into a tool call -- the text is returned as content and a
-warning is logged. Streaming emits content up to the block start (holding back a possible partial start tag),
-buffers the block, and emits each complete call (name + full arguments) once the block closes.
+warning is logged. Streaming applies the SAME rule (MC-CORE F3): content before a block streams immediately, the
+block and anything after it are buffered, and the verdict (tool calls, or everything as content) is released when the
+stream ends -- on the delta carrying the EOS token id, or via finish_streaming() for streams that end otherwise.
 """
 
 from __future__ import annotations
@@ -127,9 +128,7 @@ class DeepSeekV41EngineToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict[str, Any]] = []
         self.streamed_args_for_tool: list[str] = []
         self.current_tool_id = -1
-        self._sent_upto = 0
-        self._block_start: int | None = None
-        self._lead = ""
+        self._reset_stream()
 
     def adjust_request(self, request: ChatCompletionRequest | ResponsesRequest
                        ) -> ChatCompletionRequest | ResponsesRequest:
@@ -143,26 +142,45 @@ class DeepSeekV41EngineToolParser(ToolParser):
         return getattr(request, "tools", None) or self.tools
 
     def extract_tool_calls(self, model_output: str, request: ChatCompletionRequest) -> ExtractedToolCallInformation:
-        start = model_output.find(CALLS_START)
-        if start < 0:
-            return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
-        end = model_output.find(CALLS_END, start)
-        tail = model_output[end + len(CALLS_END):] if end >= 0 else ""
-        try:
-            if end < 0:
-                raise MalformedToolCalls("unterminated DSML calls block")
-            if tail.strip() not in ("", eos_token):
-                raise MalformedToolCalls("text after the DSML calls block")
-            calls = parse_calls_block(model_output[start: end + len(CALLS_END)], self._tools_for(request))
-        except MalformedToolCalls as exc:
-            logger.warning("DeepSeek-V4.1 DSML tool calls rejected (returned as content): %s", exc)
+        content, calls = self._verdict(model_output, request)
+        if calls is None:
             return ExtractedToolCallInformation(tools_called=False, tool_calls=[], content=model_output)
         tool_calls = [ToolCall(type="function", function=FunctionCall(name=name, arguments=args))
                       for name, args in calls]
-        content = model_output[:start]
-        if content.endswith("\n\n"):
-            content = content[:-2]
         return ExtractedToolCallInformation(tools_called=True, tool_calls=tool_calls, content=content or None)
+
+    def _verdict(self, text: str, request: Any) -> tuple[str, list[tuple[str, str]] | None]:
+        """The single acceptance rule shared by both paths: (content, calls) or (text, None) when rejected."""
+        start = text.find(CALLS_START)
+        if start < 0:
+            return text, None
+        end = text.find(CALLS_END, start)
+        try:
+            if end < 0:
+                raise MalformedToolCalls("unterminated DSML calls block")
+            if text[end + len(CALLS_END):].strip() not in ("", eos_token):
+                raise MalformedToolCalls("text after the DSML calls block")
+            calls = parse_calls_block(text[start: end + len(CALLS_END)], self._tools_for(request))
+        except MalformedToolCalls as exc:
+            logger.warning("DeepSeek-V4.1 DSML tool calls rejected (returned as content): %s", exc)
+            return text, None
+        content = text[:start]
+        return (content[:-2] if content.endswith("\n\n") else content), calls
+
+    # ---- streaming: same verdict, released when the stream ends ----
+    # Content before a block streams immediately (a possible partial "\n\n<｜DSML｜ calls>" is held back). From the
+    # block start on, the text is buffered: a block that fails to parse, or any non-whitespace text after a parsed
+    # block, rejects -> everything buffered goes out as content and the rest of the stream passes through as content
+    # (exactly what extract_tool_calls returns). Otherwise the calls are emitted when the stream ends: the delta whose
+    # token ids contain EOS, or an explicit finish_streaming() call. Held-back text is flushed at the end too.
+
+    def _reset_stream(self) -> None:
+        self._sent_upto = 0
+        self._block_start: int | None = None
+        self._pending_calls: list[tuple[str, str]] | None = None
+        self._rejected = False
+        self._finished = False
+        self._text = ""
 
     def extract_tool_calls_streaming(
         self,
@@ -174,35 +192,60 @@ class DeepSeekV41EngineToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
-        if not previous_text:
-            self._sent_upto, self._block_start = 0, None
-        if self._block_start is None:
-            start = current_text.find(CALLS_START, self._sent_upto)
-            if start < 0:
-                stop = len(current_text) - partial_tag_overlap(current_text, CALLS_LEAD)
-                if stop <= self._sent_upto:
-                    return None
-                content, self._sent_upto = current_text[self._sent_upto: stop], stop
-                return DeltaMessage(content=content)
-            lead = max(start - 2 if current_text[max(start - 2, 0): start] == "\n\n" else start, self._sent_upto)
-            content = current_text[self._sent_upto: lead]
-            self._lead = current_text[lead:start]          # dropped if the block parses, re-emitted if rejected
-            self._block_start = self._sent_upto = start
-            if content:
-                return DeltaMessage(content=content)
-        end = current_text.find(CALLS_END, self._block_start)
-        if end < 0:
+        if not previous_text or not hasattr(self, "_text"):
+            self._reset_stream()
+        self._text = current_text
+        eos_id = getattr(self.model_tokenizer, "eos_token_id", None)
+        final = eos_id is not None and eos_id in delta_token_ids
+        return self._advance(request, final)
+
+    def finish_streaming(self, request: ChatCompletionRequest) -> DeltaMessage | None:
+        """End of stream without an EOS token (length / stop string): release what is held back."""
+        if not hasattr(self, "_text"):
             return None
-        block_end = end + len(CALLS_END)
-        block = current_text[self._block_start: block_end]
-        self._block_start, self._sent_upto = None, block_end
-        try:
-            calls = parse_calls_block(block, self._tools_for(request))
-        except MalformedToolCalls as exc:
-            logger.warning("DeepSeek-V4.1 DSML tool calls rejected (streamed as content): %s", exc)
-            return DeltaMessage(content=self._lead + block)
+        return self._advance(request, True)
+
+    def _advance(self, request: Any, final: bool) -> DeltaMessage | None:
+        if self._finished:
+            return None
+        text = self._text
+        if self._rejected:                                    # pass-through after a rejection
+            return self._content_upto(len(text))
+        if self._block_start is None:
+            start = text.find(CALLS_START, self._sent_upto)
+            if start < 0:
+                hold = max(partial_tag_overlap(text, CALLS_LEAD), partial_tag_overlap(text, CALLS_START))
+                stop = len(text) if final else len(text) - hold
+                out = self._content_upto(stop)
+                self._finished = final
+                return out
+            lead = start - 2 if text[max(start - 2, 0): start] == "\n\n" else start
+            pre = self._content_upto(max(lead, self._sent_upto))
+            self._block_start = start
+            more = self._advance(request, final)
+            return _merge(pre, more)
+        end = text.find(CALLS_END, self._block_start)
+        if end < 0:
+            if final:                                         # unterminated: non-streaming returns it as content
+                return self._reject(len(text))
+            return None
+        if self._pending_calls is None:
+            try:
+                self._pending_calls = parse_calls_block(text[self._block_start: end + len(CALLS_END)],
+                                                        self._tools_for(request))
+            except MalformedToolCalls as exc:
+                logger.warning("DeepSeek-V4.1 DSML tool calls rejected (streamed as content): %s", exc)
+                return self._reject(len(text))
+        tail = text[end + len(CALLS_END):].strip()
+        # mid-stream the tail may still be a partial EOS string; at the end it must be empty or exactly EOS
+        if not (tail in ("", eos_token) or (not final and eos_token.startswith(tail))):
+            logger.warning("DeepSeek-V4.1 DSML tool calls rejected (streamed as content): text after the block")
+            return self._reject(len(text))
+        if not final:
+            return None
+        self._finished = True
         deltas = []
-        for name, args in calls:
+        for name, args in self._pending_calls:
             self.current_tool_id += 1
             self.prev_tool_call_arr.append({"name": name, "arguments": args})
             self.streamed_args_for_tool.append(args)
@@ -211,3 +254,21 @@ class DeepSeekV41EngineToolParser(ToolParser):
                                         function=DeltaFunctionCall(name=name, arguments=args).model_dump(
                                             exclude_none=True)))
         return DeltaMessage(tool_calls=deltas)
+
+    def _content_upto(self, stop: int) -> DeltaMessage | None:
+        if stop <= self._sent_upto:
+            return None
+        content, self._sent_upto = self._text[self._sent_upto: stop], stop
+        return DeltaMessage(content=content)
+
+    def _reject(self, stop: int) -> DeltaMessage | None:
+        self._rejected, self._block_start, self._pending_calls = True, None, None
+        return self._content_upto(stop)
+
+
+def _merge(a: DeltaMessage | None, b: DeltaMessage | None) -> DeltaMessage | None:
+    if a is None or b is None:
+        return a or b
+    if b.tool_calls:
+        return DeltaMessage(content=a.content, tool_calls=b.tool_calls)
+    return DeltaMessage(content=(a.content or "") + (b.content or ""))
