@@ -1263,6 +1263,11 @@ class Worker(WorkerBase):
         model = runner.get_model() if hasattr(runner, "get_model") else runner.model
         service = getattr(model, "engram_service", None)
         if service is not None:
+            if getattr(self, "use_v2_model_runner", False):
+                raise NotImplementedError(
+                    "DeepSeek-V4.1 Engram hooks (bind_batch, is_dummy_run) exist only in the V1 "
+                    "GPUModelRunner; unset VLLM_USE_V2_MODEL_RUNNER"
+                )
             if self.vllm_config.scheduler_config.async_scheduling:
                 raise NotImplementedError(
                     "DeepSeek-V4.1 Engram needs synchronous scheduling at P2 (PORT_DESIGN A9); "

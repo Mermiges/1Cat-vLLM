@@ -178,6 +178,11 @@ class DeepseekV41Model(nn.Module):
         if vllm_config.model_config.dtype != torch.float16:
             raise ValueError("DeepSeek-V4.1 on SM70 requires --dtype half (no BF16 tensor cores on Volta); got "
                              f"{vllm_config.model_config.dtype}")
+        if vllm_config.parallel_config.use_ubatching:
+            # gpu_ubatch_wrapper builds per-ubatch forward contexts without ForwardContext.is_dummy_run, which
+            # Engram keys on (PORT_DESIGN §9 AM-2), and the Engram step binding assumes one forward per step.
+            raise NotImplementedError("DeepSeek-V4.1 does not support DBO / micro-batching (--enable-dbo, "
+                                      "ubatch_size > 1)")
         # §4.1 MUST: FP16 GEMMs accumulate in FP32 without reduced-precision split-K reductions
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
         self.config = config
@@ -455,7 +460,14 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 (loader or default_weight_loader)(param, tensor)
                 loaded.add(name)
         for prefix, items in delegated.items():
-            loaded.update(f"{prefix}.{rel}" for rel in self._delegates[prefix].load_weights(items))
+            # PORT_DESIGN §9 AM-1: the module returns the module-relative checkpoint names it consumed
+            module = self._delegates[prefix]
+            consumed = set(module.load_weights(items))
+            given = {rel for rel, _ in items}
+            if consumed != given:
+                raise RuntimeError(f"{prefix}.load_weights consumed {sorted(consumed)} of {sorted(given)}; "
+                                   f"unconsumed {sorted(given - consumed)}, unknown {sorted(consumed - given)}")
+            loaded.update(f"{prefix}.{name}" for name, _ in module.named_parameters())
         return loaded
 
     @staticmethod

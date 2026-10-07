@@ -271,3 +271,38 @@ def test_contract_mismatch_and_open_subset_rejected(ds41_dist_single, ds41_check
         check_contract_constants(bad)
     with pytest.raises(ValueError, match="needs source layer 2"):
         _build(ds41_checkpoint_dir, monkeypatch, subset="0,3")
+
+
+def test_engram_unconsumed_tensor_raises(loaded_model, monkeypatch) -> None:
+    """PORT_DESIGN §9 AM-1: L-CORE raises when the Engram module does not consume every routed tensor."""
+    model, _, _ = loaded_model
+    engram = model.model.layers[1].engram
+    monkeypatch.setattr(engram, "load_weights", lambda items: {"wkv.weight"})
+    with pytest.raises(RuntimeError, match="unconsumed"):
+        model.load_weights([("layers.1.engram.wkv.weight", torch.zeros(1)),
+                            ("layers.1.engram.q_weight", torch.zeros(1))])
+
+
+def test_dummy_flag_reaches_engram(loaded_model) -> None:
+    """PORT_DESIGN §9 AM-2: the model sees ForwardContext.is_dummy_run (True only in GPUModelRunner._dummy_run)."""
+    from vllm.forward_context import set_forward_context
+
+    model, vc, _ = loaded_model
+    ids, pos = torch.tensor([0, 671]), torch.arange(2)
+    with set_current_vllm_config(vc), torch.inference_mode():
+        with set_forward_context(None, vc, num_tokens=2, is_dummy_run=True):
+            model(ids, pos, None)
+        assert model.model.layers[1].engram.last_is_dummy is True
+        with set_forward_context(None, vc, num_tokens=2):
+            model(ids, pos, None)
+        assert model.model.layers[1].engram.last_is_dummy is False
+
+
+def test_ubatching_refused(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
+    core_stubs.install(monkeypatch.setitem)
+    from vllm.models.deepseek_v41.sm70.model import DeepseekV41Model
+
+    vc = _vllm_config(ds41_checkpoint_dir)
+    vc.parallel_config.enable_dbo = True
+    with set_current_vllm_config(vc), pytest.raises(NotImplementedError, match="micro-batching"):
+        DeepseekV41Model(vllm_config=vc, prefix="model")

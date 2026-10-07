@@ -264,9 +264,13 @@ class DeepseekV41Engram(nn.Module):
         full = w.float() * s.float().repeat_interleave(32, 0).repeat_interleave(32, 1)
         self.wkv_r.data.copy_((full[:, cols] * 1024.0).to(torch.float16))
         self.qk.data.copy_(got["q_weight"].float() * got["k_weight"].float())
-        return {"wkv_r", "qk"}
+        return {"wkv.weight", "wkv.scale", "q_weight", "k_weight"}       # AM-1: consumed checkpoint names
 
     def forward(self, stream: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        # AM-2 stand-in: record which kind of step reached Engram (the real module raises on unbound real steps)
+        self.last_is_dummy = is_forward_context_available() and get_forward_context().is_dummy_run
         return stream
 
 
