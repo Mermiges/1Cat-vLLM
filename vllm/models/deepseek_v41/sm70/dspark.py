@@ -31,6 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.models.deepseek_v41 import knobs
 from vllm.models.deepseek_v41.attention import DeepseekV41Attention
 from vllm.models.deepseek_v41.common import contracts as C
 from vllm.models.deepseek_v41.common.hc import (
@@ -269,6 +270,7 @@ class DSparkBlock(nn.Module):
         super().__init__()
         from .moe import DeepseekV41MoE
 
+        self.hc_fused = knobs.env_bool("VLLM_DS41_HC_FUSED", True)
         self.attn = DSparkAttention(vc, f"{prefix}.attn", stage, shared, layer_id)
         self.ffn = DeepseekV41MoE(
             vc,
@@ -296,6 +298,8 @@ class DSparkBlock(nn.Module):
     def forward(
         self, stream: torch.Tensor, pre: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.hc_fused:
+            return self.forward_fused(stream, pre, positions)
         ap, post, comb = hc_mixes(
             stream, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
@@ -306,6 +310,34 @@ class DSparkBlock(nn.Module):
         )
         x = rmsnorm_to_act(hc_pre(stream, ap), self.ffn_norm.weight)
         return hc_post(self.ffn(x), stream, post, comb), fp
+
+    def forward_fused(
+        self, stream: torch.Tensor, pre: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from .hc_kernels import hc_fused_step
+
+        stream, mixes, x, _ = hc_fused_step(
+            stream,
+            mix=(self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base),
+            collapse_pre=pre,
+            norm_weight=self.attn_norm.weight,
+        )
+        assert mixes is not None and x is not None
+        ap, post, comb = mixes
+        stream, mixes, x, _ = hc_fused_step(
+            stream,
+            sub_out=self.attn(positions, x).contiguous(),
+            post=post,
+            comb=comb,
+            mix=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base),
+            collapse_pre=ap,
+            norm_weight=self.ffn_norm.weight,
+        )
+        assert mixes is not None and x is not None
+        fp, post, comb = mixes
+        return hc_fused_step(
+            stream, sub_out=self.ffn(x).contiguous(), post=post, comb=comb
+        )[0], fp
 
 
 class DSparkModel(nn.Module):

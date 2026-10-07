@@ -161,6 +161,10 @@ def test_draft_single_layer_golden(i, anchor, ds41_checkpoint_dir):
     from safetensors import safe_open
     from safetensors.torch import save_file
 
+    from vllm.models.deepseek_v41.sm70.hc_kernels import hc_fused_step
+
+    from .test_core_hc_kernels import _assert_act, _assert_rounding_of
+
     vc = _vllm_config(ds41_checkpoint_dir, max_tokens=256)
     vc.model_config.max_model_len = 1024
     vc.cache_config.block_size = 64
@@ -203,6 +207,14 @@ def test_draft_single_layer_golden(i, anchor, ds41_checkpoint_dir):
         stream, block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base
     )
     assert all(rel(a, b) <= 1e-6 for a, b in zip(attn_mixes, (ap, post, comb)))
+    _, fused_mixes, act, collapsed = hc_fused_step(
+        stream,
+        mix=(block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base),
+        collapse_pre=pre,
+        norm_weight=block.attn_norm.weight,
+    )
+    assert all(rel(a, b) <= 1e-6 for a, b in zip(fused_mixes, (ap, post, comb)))
+    _assert_act(act, collapsed, block.attn_norm.weight)
     x = rms_norm(
         ref_pre(stream, pre), rd.get_f32(f"{prefix}.attn_norm.weight", "cuda")
     ).half()
@@ -211,11 +223,34 @@ def test_draft_single_layer_golden(i, anchor, ds41_checkpoint_dir):
     fp, post, comb = ref_mixes(h, rd, prefix, "ffn")
     ffn_mixes = hc_mixes(h, block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base)
     assert all(rel(a, b) <= 1e-6 for a, b in zip(ffn_mixes, (fp, post, comb)))
+    _, fused_mixes, act, collapsed = hc_fused_step(
+        h,
+        mix=(block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base),
+        collapse_pre=ap,
+        norm_weight=block.ffn_norm.weight,
+    )
+    assert all(rel(a, b) <= 1e-6 for a, b in zip(fused_mixes, (fp, post, comb)))
+    _assert_act(act, collapsed, block.ffn_norm.weight)
     xff = rms_norm(
         ref_pre(h, ap), rd.get_f32(f"{prefix}.ffn_norm.weight", "cuda")
     ).half()
     moe = reference_moe(FFNTensors(prefix), xff, 3)
+    port_moe = block.ffn(xff)
+    port_router = block.ffn.gate_logits(xff)
+    _, port_experts = block.ffn.route(port_router)
+    moe_rms = rel(port_moe, moe["out"])
+    router_rms = rel(port_router, moe["logits"])
+    assert moe_rms <= 3e-3
+    assert router_rms <= 1e-5
+    assert torch.equal(port_experts.sort(-1).values.long(), moe["ids"].sort(-1).values)
     golden = ref_post(moe["out"], h, post, comb)
+    fused_post = hc_fused_step(
+        h, sub_out=moe["out"].contiguous(), post=post, comb=comb
+    )[0]
+    truth_post = post.double()[..., None] * moe["out"].double()[:, None] + torch.einsum(
+        "tjc,tjd->tcd", comb.double(), h.double()
+    )
+    _assert_rounding_of(fused_post, truth_post)
     ctx = ForwardContext(
         no_compile_layers=vc.compilation_config.static_forward_context,
         attn_metadata={cache.layer_name: md},
@@ -224,6 +259,8 @@ def test_draft_single_layer_golden(i, anchor, ds41_checkpoint_dir):
     with override_forward_context(ctx):
         actual, actual_pre = block(stream, pre, pos)
         actual_aout = block.attn(pos, x)
+        block.hc_fused = False
+        unfused, unfused_pre = block(stream, pre, pos)
     rms = rel(actual, golden)
     attn_rms = rel(actual_aout, aout)
     OUT.mkdir(parents=True, exist_ok=True)
@@ -246,7 +283,12 @@ def test_draft_single_layer_golden(i, anchor, ds41_checkpoint_dir):
         "source_golden": str(GOLD),
         "stream_rel_rms": rms,
         "attention_rel_rms": attn_rms,
+        "moe_rel_rms": moe_rms,
+        "router_rel_rms": router_rms,
+        "expert_sets_equal": True,
         "pre_rel_rms": rel(actual_pre, fp),
+        "fused_unfused_pre_rel_rms": rel(actual_pre, unfused_pre),
+        "fused_unfused_stream_rel_rms": rel(actual, unfused),
     }
     (OUT / f"{stem}.json").write_text(json.dumps(report, indent=2) + "\n")
     print(report)

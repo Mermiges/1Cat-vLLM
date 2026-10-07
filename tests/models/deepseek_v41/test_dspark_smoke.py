@@ -110,15 +110,23 @@ def test_full_real_draft_load_and_latency(ds41_checkpoint_dir):
 
     with override_forward_context(ctx):
         expected = propose()
-        for _ in range(3):
-            assert torch.equal(propose(), expected)
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        for _ in range(10):
-            got = propose()
-        torch.cuda.synchronize()
-        round_ms = (time.perf_counter() - start) * 100
-    assert torch.equal(got, expected)
+        latencies = {"unfused": [], "fused": []}
+        for mode in (False, True, True, False, False, True):
+            for layer in model.model.layers:
+                layer.hc_fused = mode
+            for _ in range(3):
+                assert torch.equal(propose(), expected)
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            for _ in range(20):
+                got = propose()
+            torch.cuda.synchronize()
+            latencies["fused" if mode else "unfused"].append(
+                (time.perf_counter() - start) * 50
+            )
+            assert torch.equal(got, expected)
+    for layer in model.model.layers:
+        layer.hc_fused = True
     # Profile path must run projections without a bound metadata/cache lookup.
     model.precompute_and_store_context_kv(context, pos)
     with override_forward_context(
@@ -134,7 +142,8 @@ def test_full_real_draft_load_and_latency(ds41_checkpoint_dir):
         "tp": 1,
         "draft_block": 5,
         "loaded_parameters": len(loaded),
-        "draft_round_ms": round_ms,
+        "draft_round_ms": float(np.median(latencies["fused"])),
+        "hc_round_ms_samples": latencies,
         "includes_context_tokens": 5,
         "includes_full_vocab_markov": True,
         "draft_ids": expected.tolist(),
