@@ -48,7 +48,7 @@ def _v41_model(partition: list[int], rank: int, config):
     from vllm.models.deepseek_v41.sm70.model import DeepseekV41Model
 
     fake = SimpleNamespace(stage=make_stage_plan(config, rank, len(partition), partition),
-                           pp_is_first=rank == 0, pp_is_last=rank == len(partition) - 1)
+                           pp_is_first=rank == 0, pp_is_last=rank == len(partition) - 1, kv20_crc_check=False)
     fake._schema = functools.partial(DeepseekV41Model._schema, fake)
     fake.pp_static_schema = functools.partial(DeepseekV41Model.pp_static_schema, fake)
     fake.pp_send_schema = functools.partial(DeepseekV41Model.pp_send_schema, fake)

@@ -18,6 +18,7 @@ import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.models.deepseek_v41.common import contracts as C
 from vllm.models.deepseek_v41.common.topology import make_stage_plan
+from vllm.sequence import IntermediateTensors
 
 from . import core_stubs
 from .test_core_hc import ref_hc_mixes, ref_hc_post, ref_hc_pre
@@ -238,14 +239,16 @@ def test_map_checkpoint_name_all_census_names() -> None:
         "model.layers.3.ffn.shared_experts.down_proj.weight"
 
 
+@pytest.mark.parametrize("crc_check", [False, True])
 @pytest.mark.parametrize("partition", [[20, 20], [14, 14, 12]])
-def test_pp_schema_sender_equals_receiver(ds41_text_config, partition: list[int]) -> None:
-    from vllm.models.deepseek_v41.sm70.model import DeepseekV41Model
+def test_pp_schema_sender_equals_receiver(ds41_text_config, partition: list[int], crc_check: bool) -> None:
+    from vllm.models.deepseek_v41.sm70.model import KV20_CRC_KEY, DeepseekV41Model
 
     stages = []
     for rank in range(len(partition)):
         fake = SimpleNamespace(stage=make_stage_plan(ds41_text_config, rank, len(partition), partition),
-                               pp_is_first=rank == 0, pp_is_last=rank == len(partition) - 1)
+                               pp_is_first=rank == 0, pp_is_last=rank == len(partition) - 1,
+                               kv20_crc_check=crc_check)
         fake._schema = functools.partial(DeepseekV41Model._schema, fake)
         stages.append(fake)
     for t in (1, 3, 8):
@@ -259,7 +262,48 @@ def test_pp_schema_sender_equals_receiver(ds41_text_config, partition: list[int]
             assert all(empty.tensors[k].shape == recv[k][0] and empty.tensors[k].dtype == recv[k][1] for k in recv)
     payload = sum(torch.Size(shape).numel() * dtype.itemsize
                   for shape, dtype in DeepseekV41Model.pp_static_schema(stages[-1], 1).values())
-    assert payload == (50448 if len(partition) == 3 else 40976)                # §3.5 bytes/token
+    # §3.5 bytes/token; the mirror check adds 4 B/token (kv20_crc int32) on the kv-source-20 boundary only
+    assert payload == (50448 + 4 * crc_check if len(partition) == 3 else 40976)
+    assert (KV20_CRC_KEY in DeepseekV41Model.pp_static_schema(stages[-1], 1)) == (crc_check and len(partition) == 3)
+
+
+def _pp_fake(stage_kwargs: dict, **attrs):
+    from vllm.models.deepseek_v41.sm70.model import DeepseekV41Model
+
+    fake = SimpleNamespace(stage=SimpleNamespace(**stage_kwargs), pp_is_first=False, pp_is_last=False, layers=[],
+                           start_layer=0, end_layer=0, **attrs)
+    fake.forward = functools.partial(DeepseekV41Model.forward, fake)
+    return fake
+
+
+@pytest.mark.parametrize("crc_check", [False, True])
+def test_kv20_crc_travels_exporter_to_mirror(crc_check: bool) -> None:
+    """VLLM_DS41_ATTN_MIRROR_CHECK=1: the exporting stage packs kv20_crc(ckv, ik) and the mirror stage hands it to
+    ingest(..., crc=); off: no key, crc=None."""
+    from vllm.models.deepseek_v41.sm70.model import KV20_CRC_KEY
+
+    T, gen = 3, torch.Generator().manual_seed(7)
+    shared = SimpleNamespace(export_ckv=torch.randn(8, C.CKV_RECORD_DIM, generator=gen).half(),
+                             export_ik=torch.randn(8, C.IK_RECORD_DIM, generator=gen).half(),
+                             candidate_blocks=torch.randint(0, 9, (8, C.CAND_TOPK_BLOCKS), dtype=torch.int32))
+    exporter = _pp_fake(dict(exports_kv_sources=(C.CAND_SOURCE,), mirrored_kv_sources=()), shared=shared,
+                        mirror=None, kv20_crc_check=crc_check,
+                        _kv20_crc=core_stubs.kv20_crc if crc_check else None)
+    pre_in = {C.PP_KEY_HIDDEN: torch.zeros(T, C.HC, 4), C.PP_KEY_PRE_MIX: torch.zeros(T, C.HC)}
+    out = exporter.forward(None, torch.arange(T), IntermediateTensors(dict(pre_in)))
+    assert (KV20_CRC_KEY in out.tensors) == crc_check
+    mirror_shared = SimpleNamespace(candidate_blocks=torch.zeros(8, C.CAND_TOPK_BLOCKS, dtype=torch.int32))
+    mirror = core_stubs.DeepseekV41KVSourceMirror(None, C.CAND_SOURCE, mirror_shared)
+    receiver = _pp_fake(dict(exports_kv_sources=(), mirrored_kv_sources=(C.CAND_SOURCE,)), mirror=mirror,
+                        kv20_crc_check=crc_check)
+    receiver.forward(None, torch.arange(T), out)
+    if crc_check:
+        want = (shared.export_ckv[:T].view(torch.int16).sum(-1, dtype=torch.int32)
+                + shared.export_ik[:T].view(torch.int16).sum(-1, dtype=torch.int32))
+        assert out.tensors[KV20_CRC_KEY].dtype == torch.int32 and out.tensors[KV20_CRC_KEY].shape == (T,)
+        assert torch.equal(mirror.crcs[-1], want)
+    else:
+        assert mirror.crcs == [None]
 
 
 def test_contract_mismatch_and_open_subset_rejected(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:

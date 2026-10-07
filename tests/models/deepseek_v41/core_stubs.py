@@ -281,9 +281,21 @@ class DeepseekV41KVSourceMirror(nn.Module):
         self.shared = shared
         self.ingested: list = []
 
-    def ingest(self, positions, ckv, ik, cand) -> None:
+        self.crcs: list = []
+
+    def ingest(self, positions, ckv, ik, cand, crc=None) -> None:
         self.shared.candidate_blocks[: cand.shape[0]].copy_(cand)
         self.ingested.append((ckv.shape, ik.shape, cand.shape))
+        self.crcs.append(None if crc is None else crc.clone())
+
+
+MIRROR_CHECK_ENV = "VLLM_DS41_ATTN_MIRROR_CHECK"
+PP_KEY_KV20_CRC = "kv20_crc"
+
+
+def kv20_crc(ckv, ik):
+    """Same formula as ds41/attn kv_mirror.kv20_crc."""
+    return ckv.view(torch.int16).sum(dim=-1, dtype=torch.int32) + ik.view(torch.int16).sum(dim=-1, dtype=torch.int32)
 
 
 _MODULES = {
@@ -292,7 +304,8 @@ _MODULES = {
                                           "make_v41_moe_method"),
     "vllm.models.deepseek_v41.common.engram": ("DeepseekV41Engram",),
     "vllm.models.deepseek_v41.common.engram_host": ("EngramHostService",),
-    "vllm.models.deepseek_v41.kv_mirror": ("DeepseekV41KVSourceMirror",),
+    "vllm.models.deepseek_v41.kv_mirror": ("DeepseekV41KVSourceMirror", "MIRROR_CHECK_ENV", "PP_KEY_KV20_CRC",
+                                           "kv20_crc"),
 }
 
 

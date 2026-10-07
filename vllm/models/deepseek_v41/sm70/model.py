@@ -53,6 +53,10 @@ ENGRAM_DIR_DEFAULT = "/home/mermiges/ds41-engram"
 SPILL_KNOB = "VLLM_DS41_CORE_SPILL_EXPERTS_PER_LAYER"
 LAYER_SUBSET_KNOB = "VLLM_DS41_CORE_LAYER_SUBSET"   # e.g. "0,1,2,3": run only these backbone layers (I1 / smoke)
 LAYER_SUBSET_ALLOW_KNOB = "VLLM_DS41_CORE_ALLOW_LAYER_SUBSET"   # must be 1 too: a subset is a debug-only partial model
+# L-ATTN's cross-stage KV-mirror check (ds41/attn kv_mirror.py MIRROR_CHECK_ENV / PP_KEY_KV20_CRC; contracts.py is
+# frozen, so the extra payload key lives here and is cross-checked against kv_mirror when the knob is on)
+MIRROR_CHECK_KNOB = "VLLM_DS41_ATTN_MIRROR_CHECK"
+KV20_CRC_KEY = "kv20_crc"
 
 logger = init_logger(__name__)
 _LAYER_RE = re.compile(r"^layers\.(\d+)\.")
@@ -271,6 +275,17 @@ class DeepseekV41Model(nn.Module):
         if (self.start_layer, self.end_layer) != (self.stage.first_layer, self.stage.last_layer + 1):
             raise RuntimeError(f"make_layers range [{self.start_layer},{self.end_layer}) != stage plan "
                                f"[{self.stage.first_layer},{self.stage.last_layer}]")
+        # with VLLM_DS41_ATTN_MIRROR_CHECK=1 the kv-source-20 boundary also carries kv20_crc [T] int32
+        self.kv20_crc_check = knobs.env_bool(MIRROR_CHECK_KNOB, False)
+        self._kv20_crc: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None
+        if self.kv20_crc_check and C.CAND_SOURCE in self.stage.exports_kv_sources + self.stage.mirrored_kv_sources:
+            from .. import kv_mirror
+
+            if (kv_mirror.PP_KEY_KV20_CRC, kv_mirror.MIRROR_CHECK_ENV) != (KV20_CRC_KEY, MIRROR_CHECK_KNOB):
+                raise RuntimeError(f"kv_mirror's CRC key/knob {kv_mirror.PP_KEY_KV20_CRC!r}/"
+                                   f"{kv_mirror.MIRROR_CHECK_ENV!r} != the model's {KV20_CRC_KEY!r}/"
+                                   f"{MIRROR_CHECK_KNOB!r}")
+            self._kv20_crc = kv_mirror.kv20_crc
         self.mirror: nn.Module | None = None
         if C.CAND_SOURCE in self.stage.mirrored_kv_sources:
             from ..kv_mirror import DeepseekV41KVSourceMirror
@@ -298,6 +313,8 @@ class DeepseekV41Model(nn.Module):
             schema[C.PP_KEY_KV20_CKV] = ((num_tokens, C.CKV_RECORD_DIM), C.KV_RECORD_DTYPE)
             schema[C.PP_KEY_KV20_IK] = ((num_tokens, C.IK_RECORD_DIM), C.KV_RECORD_DTYPE)
             schema[C.PP_KEY_CAND20] = ((num_tokens, C.CAND_TOPK_BLOCKS), torch.int32)
+            if self.kv20_crc_check:
+                schema[KV20_CRC_KEY] = ((num_tokens,), torch.int32)
         return schema
 
     def pp_static_schema(self, num_tokens: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
@@ -337,7 +354,8 @@ class DeepseekV41Model(nn.Module):
             pre = intermediate_tensors[C.PP_KEY_PRE_MIX]
             if self.mirror is not None:
                 self.mirror.ingest(positions, intermediate_tensors[C.PP_KEY_KV20_CKV],
-                                   intermediate_tensors[C.PP_KEY_KV20_IK], intermediate_tensors[C.PP_KEY_CAND20])
+                                   intermediate_tensors[C.PP_KEY_KV20_IK], intermediate_tensors[C.PP_KEY_CAND20],
+                                   crc=intermediate_tensors[KV20_CRC_KEY] if self.kv20_crc_check else None)
         for layer in self.layers[self.start_layer:self.end_layer]:
             if isinstance(layer, PPMissingLayer):   # layer outside the configured subset
                 continue
@@ -350,6 +368,9 @@ class DeepseekV41Model(nn.Module):
                 out[C.PP_KEY_KV20_CKV] = self.shared.export_ckv[:num_tokens]
                 out[C.PP_KEY_KV20_IK] = self.shared.export_ik[:num_tokens]
                 out[C.PP_KEY_CAND20] = self.shared.candidate_blocks[:num_tokens]
+                if self.kv20_crc_check:
+                    assert self._kv20_crc is not None
+                    out[KV20_CRC_KEY] = self._kv20_crc(out[C.PP_KEY_KV20_CKV], out[C.PP_KEY_KV20_IK])
             if ds41_dump.ENABLED:
                 ds41_dump.end_forward()
             return IntermediateTensors(out)
