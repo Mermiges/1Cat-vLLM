@@ -335,3 +335,23 @@ def test_renderer_registered_for_tokenizer_mode() -> None:
     from vllm.renderers.registry import RENDERER_REGISTRY
 
     assert RENDERER_REGISTRY.load_renderer_cls("deepseek_v41") is DeepseekV4Renderer
+
+
+@pytest.mark.parametrize("case_id", TEXT_ONLY)
+def test_renderer_prompt_matches_official_fixture(case_id: int, v41_tokenizer, hf_tokenizer, monkeypatch) -> None:
+    """L-CORE review of 17aae38bc: the chat path the server takes (DeepseekV4Renderer.render_messages with the V4.1
+    tokenizer, kwargs from ChatParams) yields exactly the official encoder's tokens for every text-only fixture."""
+    from vllm.renderers import deepseek_v4 as renderer_mod
+    from vllm.renderers.params import ChatParams
+
+    messages, tools, kwargs = _case_request(case_id)
+    # parse_chat_messages needs a full ModelConfig; the V4.1 tokenizer encodes the original ``messages`` (not the
+    # flattened conversation), so a pass-through keeps the path under test intact.
+    monkeypatch.setattr(renderer_mod, "parse_chat_messages", lambda msgs, *a, **k: (list(msgs), None, None))
+    renderer = renderer_mod.DeepseekV4Renderer.__new__(renderer_mod.DeepseekV4Renderer)
+    renderer.model_config = None
+    renderer.get_tokenizer = lambda: v41_tokenizer
+    params = ChatParams(chat_template_kwargs={"tools": tools, **kwargs})
+    _, prompt = renderer.render_messages(messages, params)
+    expected = (FIXTURES / f"test_output_{case_id}.txt").read_text()
+    assert prompt["prompt_token_ids"] == hf_tokenizer.encode(expected, add_special_tokens=False)

@@ -379,6 +379,13 @@ def test_ubatching_refused(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -
     ({"head.weight"}, "lm_head.weight"),
     ({"norm.weight"}, "model.norm.weight"),
     ({"layers.3.attn.wq_b.scale"}, "model.layers.3.attn.wq_b.weight_scale_inv"),
+    # N1: one shard of a fused parameter (the other shard alone used to mark the parameter loaded)
+    ({"layers.2.attn.wq_a.weight"}, "model.layers.2.attn.fused_wqa_wkv.weight lacks attn.wq_a"),
+    ({"layers.2.attn.wkv.scale"}, "model.layers.2.attn.fused_wqa_wkv.weight_scale_inv lacks attn.wkv"),
+    ({"layers.3.ffn.shared_experts.w3.scale"},
+     "model.layers.3.ffn.shared_experts.gate_up_proj.weight_scale_inv lacks shared_experts.w3"),
+    ({"layers.0.ffn.shared_experts.w1.weight"},
+     "model.layers.0.ffn.shared_experts.gate_up_proj.weight lacks shared_experts.w1"),
     ({"layers.1.engram.q_weight", "layers.1.engram.k_weight", "layers.1.engram.wkv.weight",
       "layers.1.engram.wkv.scale"}, "no checkpoint tensors reached"),
 ])
@@ -388,6 +395,60 @@ def test_incomplete_checkpoint_raises(ds41_dist_single, ds41_checkpoint_dir, mon
     weights = ((n, t) for n, t in _weights_for({0, 1, 2, 3}) if n not in withheld)
     with pytest.raises(RuntimeError, match=expect.replace(".", r"\.")):
         model.load_weights(weights)
+
+
+def _compressor_pair_names() -> tuple[str, str] | None:
+    names = {e["name"] for e in _census_entries()}
+    for layer in (0, 1, 2, 3):
+        wkv, wgate = f"layers.{layer}.attn.compressor.wkv.weight", f"layers.{layer}.attn.compressor.wgate.weight"
+        if wkv in names and wgate in names:
+            return wkv, wgate
+    return None
+
+
+def test_incomplete_compressor_pair_raises(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
+    """N1: compressor wkv/wgate share fused_wkv_wgate; withholding wgate alone must raise."""
+    pair = _compressor_pair_names()
+    if pair is None:
+        pytest.skip("no fused compressor among layers 0-3 in the census")
+    model, _ = _build(ds41_checkpoint_dir, monkeypatch)
+    weights = ((n, t) for n, t in _weights_for({0, 1, 2, 3}) if n != pair[1])
+    with pytest.raises(RuntimeError, match=r"compressor\.fused_wkv_wgate\.weight lacks compressor\.wgate"):
+        model.load_weights(weights)
+
+
+def _routed_expert_weights(layer: int, skip: set[str]):
+    for e in range(C.N_EXPERTS):
+        for shard in ("w1", "w2", "w3"):
+            for suffix in ("weight", "scale"):
+                name = f"layers.{layer}.ffn.experts.{e}.{shard}.{suffix}"
+                if name not in skip:
+                    yield name, torch.empty(0, dtype=torch.uint8)
+
+
+@pytest.mark.parametrize("withheld, expect", [
+    ({"layers.1.ffn.experts.5.w2.weight"}, r"experts\.w2_weight lacks expert 5 w2"),
+    ({"layers.1.ffn.experts.383.w3.scale"}, r"experts\.w13_weight_scale lacks expert 383 w3"),
+    ({f"layers.1.ffn.experts.{e}.w1.weight" for e in range(10)}, r"experts\.w13_weight lacks expert 0 w1, .*\(10 total\)"),
+])
+def test_incomplete_routed_experts_raise(ds41_dist_single, ds41_checkpoint_dir, monkeypatch, withheld, expect) -> None:
+    """N1: one expert's shard missing used to pass (any expert load marked the stacked parameter loaded)."""
+    calls: list = []
+    monkeypatch.setattr(core_stubs._Experts, "weight_loader",
+                        lambda self, param, loaded, name, shard_id, expert_id, return_success=False:
+                        calls.append((expert_id, shard_id)) or True)
+    model, _ = _build(ds41_checkpoint_dir, monkeypatch)
+    weights = list(_weights_for({0, 1, 2, 3})) + list(_routed_expert_weights(1, withheld))
+    with pytest.raises(RuntimeError, match=expect):
+        model.load_weights(iter(weights))
+    assert len(calls) == C.N_EXPERTS * 6 - len(withheld)
+
+
+def test_complete_routed_experts_pass(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
+    monkeypatch.setattr(core_stubs._Experts, "weight_loader", lambda self, *a, **k: True)
+    model, _ = _build(ds41_checkpoint_dir, monkeypatch)
+    loaded = model.load_weights(iter(list(_weights_for({0, 1, 2, 3})) + list(_routed_expert_weights(1, set()))))
+    assert "model.layers.1.ffn.experts.w13_weight" in loaded
 
 
 def test_derived_params_exempt(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
