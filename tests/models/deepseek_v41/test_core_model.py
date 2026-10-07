@@ -327,3 +327,12 @@ def test_derived_params_exempt(ds41_dist_single, ds41_checkpoint_dir, monkeypatc
     model, _ = _build(ds41_checkpoint_dir, monkeypatch)
     model.model.norm.ds41_no_checkpoint_params = ("weight",)
     model.load_weights((n, t) for n, t in _weights_for({0, 1, 2, 3}) if n != "norm.weight")
+
+
+def test_engram_io_threads_from_pp_size(loaded_model) -> None:
+    """D11 ENGRAM F1 / AM-12: io_threads 4 (no PP), 2 (PP2), 1 (PP3)."""
+    from vllm.models.deepseek_v41.sm70.model import engram_io_threads
+
+    assert [engram_io_threads(n) for n in (1, 2, 3)] == [4, 2, 1]
+    model, _, _ = loaded_model
+    assert model.engram_service.io_threads == 4

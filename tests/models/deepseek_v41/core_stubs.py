@@ -219,7 +219,7 @@ def make_v41_moe_method(moe):
 class EngramHostService:
     def __init__(self, hf_config, layers, tp_rank, tp_size, row_dir, tokenizer_path, max_num_batched_tokens,
                  device, io_threads=4) -> None:
-        self.layers, self.tp_rank, self.tp_size = layers, tp_rank, tp_size
+        self.layers, self.tp_rank, self.tp_size, self.io_threads = layers, tp_rank, tp_size, io_threads
         self.plans: list = []
         self.layouts: list = []
 

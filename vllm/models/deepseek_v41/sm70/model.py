@@ -94,6 +94,12 @@ def pipeline_partition(num_layers: int, pp_size: int) -> list[int]:
     return counts
 
 
+def engram_io_threads(pp_size: int) -> int:
+    """Engram pread threads per rank (D11 / AM-12): 2 under PP2, 1 under PP3+ (CPU budget: 12 cores for 8-12
+    workers), the service default 4 without PP. VLLM_DS41_ENGRAM_IO_THREADS still overrides inside the service."""
+    return 4 if pp_size == 1 else (2 if pp_size == 2 else 1)
+
+
 def parse_layer_subset(stage: StagePlan, config: Any) -> frozenset[int] | None:
     """Optional layer subset (knob) restricted to this stage; must be closed under the source relation."""
     raw = knobs.env_str(LAYER_SUBSET_KNOB, "")
@@ -229,7 +235,7 @@ class DeepseekV41Model(nn.Module):
             self._engram_service = EngramHostService(
                 config, engram_layers, get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size(),
                 knobs.env_str(ENGRAM_DIR_KNOB, ENGRAM_DIR_DEFAULT), vllm_config.model_config.tokenizer,
-                max_tokens, device)
+                max_tokens, device, io_threads=engram_io_threads(pp.world_size))
         self.spill: ExpertSpillPlan | None = None
         n_spill = knobs.env_int(SPILL_KNOB, 0, minimum=0, maximum=C.N_EXPERTS - 1)
         if n_spill > 0:
