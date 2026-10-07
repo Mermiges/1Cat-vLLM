@@ -35,7 +35,8 @@ from vllm.triton_utils import tl, triton
 
 GROUP = 32
 PANEL = 32                # TurboMind FP8 B-operand panel: 32 output rows x K, stored [K/8][32][8]
-_SCALE_EXP_MIN, _SCALE_EXP_MAX = -14, 7  # every E4M3 code x 2^e is a finite, exact FP16 value (module doc)
+SCALE_EXP_MIN, SCALE_EXP_MAX = -14, 7  # every E4M3 code x 2^e is a finite, exact FP16 value (module doc)
+_SCALE_EXP_MIN, _SCALE_EXP_MAX = SCALE_EXP_MIN, SCALE_EXP_MAX
 GEMV_MAX_M = 8            # the GEMV unrolls up to 8 rows
 GEMV_MAX_M_FP16 = 2       # FP16 output: GEMV for M <= 2, TurboMind above (P5 bench, L-MOE progress)
 TM_MAX_M = 64             # FP16 output: TurboMind up to here, dequant + cuBLAS above
@@ -63,6 +64,14 @@ def _scale_fp32(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype == torch.float32:
         return scale
     raise TypeError(f"FP8 g32 scale dtype {scale.dtype} (expected float8_e8m0fnu, uint8 E8M0 or float32)")
+
+
+def scale_exponent_range(scale: torch.Tensor) -> tuple[int, int]:
+    """(min, max) exponent e of the UE8M0 block scales 2^e (raises on non-powers of two)."""
+    mant, exp = torch.frexp(_scale_fp32(scale))
+    if not bool((mant == 0.5).all()):
+        raise ValueError("FP8 g32: scales must be exact powers of two (UE8M0)")
+    return int(exp.min()) - 1, int(exp.max()) - 1
 
 
 def prepare_fp8_g32(weight: torch.Tensor, scale: torch.Tensor) -> Fp8G32Weight:
@@ -118,12 +127,17 @@ def _row_out(out_ptr, i: tl.constexpr, stride_om, rows, acc, alpha, M, OUT_FP16:
 
 
 @triton.jit
-def _fp8_tm_gemv_kernel(x_ptr, w_ptr, s_ptr, out_ptr, M, N, K, k_ld, alpha, stride_xm, stride_om,
-                        M_PAD: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_KC: tl.constexpr, OUT_FP16: tl.constexpr):
-    """out[:M, n0:n0+BLOCK_N] = alpha * x @ W^T. W bytes of a 32-row panel are [K/8][32][8] with the physical
+def _fp8_tm_gemv_kernel(x_ptr, w_ptr, s_ptr, out_ptr, M, N, K, k_ld, alpha, stride_xm, stride_om, group_n,
+                        stride_xg, M_PAD: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_KC: tl.constexpr,
+                        OUT_FP16: tl.constexpr):
+    """out[:M, n0:n0+BLOCK_N] = alpha * x_g @ W^T. W bytes of a 32-row panel are [K/8][32][8] with the physical
     byte order [0, 2, 1, 3, 4, 6, 5, 7] inside each 8-byte chunk. E4M3 -> FP16 by bits: ((b & 0x7F) << 7 |
-    (b & 0x80) << 8) is the value x 2^-8 (normals and subnormals alike), folded into the FP32 scale (x 256)."""
+    (b & 0x80) << 8) is the value x 2^-8 (normals and subnormals alike), folded into the FP32 scale (x 256).
+    Block-diagonal (grouped) weights: output rows [g * group_n, (g + 1) * group_n) read the x columns starting at
+    g * stride_xg (group_n = N, stride_xg = 0 for a plain linear). x may be FP16 or FP32 (exact products either way
+    up to the FP32 rounding of the product)."""
     n0 = tl.program_id(0) * BLOCK_N
+    x_ptr += (n0 // group_n) * stride_xg
     kc = tl.arange(0, BLOCK_KC)
     ni = (n0 % 32) + tl.arange(0, BLOCK_N)
     j = tl.arange(0, 8)
@@ -173,7 +187,7 @@ _GEMV_TABLE: dict[tuple[int, int, int], tuple[int, int, int]] = {
     (1792, 5120, 4): (4, 32, 1), (1792, 5120, 8): (4, 16, 1),
     (8192, 1280, 4): (32, 8, 4), (8192, 1280, 8): (32, 4, 2),
     (4096, 1280, 4): (8, 16, 1), (4096, 1280, 8): (32, 8, 4),
-    (1024, 4096, 4): (4, 64, 2), (1024, 4096, 8): (2, 32, 1),
+    (1024, 4096, 4): (4, 32, 1), (1024, 4096, 8): (4, 16, 1),   # P5-MOE sweep: grouped wo_a (2 x 1024 rows)
     (5120, 2048, 4): (8, 16, 1), (5120, 2048, 8): (32, 8, 4),
     (1152, 5120, 4): (4, 64, 2), (1152, 5120, 8): (4, 16, 1),
     (5120, 576, 4): (32, 8, 4), (5120, 576, 8): (32, 8, 4),
@@ -200,20 +214,29 @@ def _gemv_config(n: int, k: int, m_pad: int) -> tuple[int, int, int]:
 
 
 def fp8_g32_gemv(x: torch.Tensor, w: Fp8G32Weight, *, out_dtype: torch.dtype = torch.float32,
-                 alpha: float = 1.0, out: torch.Tensor | None = None) -> torch.Tensor:
-    """``alpha * x @ W^T`` for x [M <= 8, K] fp16 (row-major); FP32 accumulation; FP32 or FP16 output."""
-    _check_x(x, w)
+                 alpha: float = 1.0, out: torch.Tensor | None = None, groups: int = 1) -> torch.Tensor:
+    """``alpha * x @ W^T`` for x [M <= 8, K] fp16 or fp32 (row-major, any row stride); FP32 accumulation; FP32 or
+    FP16 output. ``groups > 1``: block-diagonal W, x fp16 [M, groups * K] (see ``fp8_g32_grouped``)."""
     m = x.shape[0]
+    if groups == 1:
+        _check_x(x, w, allow_fp32=True)
+        group_n, stride_xg = w.n, 0
+    else:
+        _check_grouped(x, w, groups)
+        group_n, stride_xg = w.n // groups, w.k
     if m > GEMV_MAX_M:
         raise ValueError(f"fp8_g32_gemv serves at most {GEMV_MAX_M} rows, got {m}")
     out = _out(x, w, out_dtype, out)
     if m == 0:
         return out
     m_pad = max(1, triton.next_power_of_2(m))
-    block_n, block_kc, warps = _gemv_config(w.n, w.k, m_pad)
+    block_n, block_kc, warps = _gemv_config(group_n, w.k, m_pad)
+    if group_n % block_n:
+        raise ValueError(f"fp8_g32_gemv: row block {block_n} does not divide the group size {group_n}")
     _fp8_tm_gemv_kernel[(w.n // block_n,)](
         x, w.tm_weight, w.tm_scales, out, m, w.n, w.k, w.k_ld, float(alpha), x.stride(0), out.stride(0),
-        M_PAD=m_pad, BLOCK_N=block_n, BLOCK_KC=block_kc, OUT_FP16=out_dtype == torch.float16, num_warps=warps,
+        group_n, stride_xg, M_PAD=m_pad, BLOCK_N=block_n, BLOCK_KC=block_kc, OUT_FP16=out_dtype == torch.float16,
+        num_warps=warps,
     )
     return out
 
@@ -227,6 +250,44 @@ def fp8_g32_turbomind(x: torch.Tensor, w: Fp8G32Weight, out: torch.Tensor | None
     out = _out(x, w, torch.float16, out)
     if x.shape[0]:
         sm70_ops.fp8_gemm_sm70_out(out, x.contiguous(), w.tm_weight, w.tm_scales, GROUP, w.k_ld, w.q_ld, False)
+    return out
+
+
+@triton.jit
+def _fp8_tm_rows_kernel(w_ptr, s_ptr, out_ptr, N, K, k_ld, BLOCK_N: tl.constexpr, BLOCK_KC: tl.constexpr,
+                        OUT_FP16: tl.constexpr):
+    """out[n, k] (row-major [N, K]) = the exact E4M3 x 2^e value of the TurboMind-packed weight (see the GEMV)."""
+    n0 = tl.program_id(0) * BLOCK_N
+    c0 = tl.program_id(1) * BLOCK_KC
+    kc = c0 + tl.arange(0, BLOCK_KC)
+    nl = tl.arange(0, BLOCK_N)
+    j = tl.arange(0, 8)
+    logical_k = (j & 4) | ((j & 1) << 1) | ((j >> 1) & 1)
+    rows = n0 + nl
+    b = tl.load(w_ptr + (rows // 32).to(tl.int64)[None, :, None] * k_ld + kc[:, None, None] * 256
+                + (rows % 32)[None, :, None] * 8 + j[None, None, :]).to(tl.uint16)
+    w = (((b & 0x7F) << 7) | ((b & 0x80) << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+    scale = tl.load(s_ptr + (kc // 4)[:, None] * N + rows[None, :]).to(tl.float32) * 256.0
+    val = w * scale[:, :, None]                                   # exact: 4-bit mantissa x power of two
+    ptrs = out_ptr + rows.to(tl.int64)[None, :, None] * K + (kc[:, None, None] * 8 + logical_k[None, None, :])
+    if OUT_FP16:
+        tl.store(ptrs, val.to(tl.float16))
+    else:
+        tl.store(ptrs, val)
+
+
+def dequant_fp8_g32_rows(w: Fp8G32Weight, out_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """The weight as a row-major [N, K] matrix in FP32 or FP16 -- the same values (and layout) as the FP16
+    fallback's weight (``.float()`` for FP32), so a cuBLAS product with it is bitwise the fallback's."""
+    if out_dtype not in (torch.float32, torch.float16):
+        raise TypeError(f"dequant_fp8_g32_rows: out_dtype {out_dtype} not supported")
+    out = torch.empty((w.n, w.k), dtype=out_dtype, device=w.tm_weight.device)
+    block_n, block_kc = 32, 16
+    if (w.k // 8) % block_kc:
+        block_kc = 4
+    _fp8_tm_rows_kernel[(w.n // block_n, (w.k // 8) // block_kc)](
+        w.tm_weight, w.tm_scales, out, w.n, w.k, w.k_ld, BLOCK_N=block_n, BLOCK_KC=block_kc,
+        OUT_FP16=out_dtype == torch.float16, num_warps=4)
     return out
 
 
@@ -269,6 +330,23 @@ def fp8_g32_linear(x: torch.Tensor, w: Fp8G32Weight, *, out_dtype: torch.dtype =
     return fp8_g32_dequant_mm(x, w, out_dtype=out_dtype, out=out)
 
 
+def fp8_g32_grouped(x: torch.Tensor, w: Fp8G32Weight, groups: int, *, out_dtype: torch.dtype = torch.float16,
+                    out: torch.Tensor | None = None) -> torch.Tensor:
+    """Block-diagonal linear: W [groups * Ng, K] (one prepared weight), x [M, groups * K] fp16 ->
+    out [M, groups * Ng] with ``out[:, g*Ng:(g+1)*Ng] = x[:, g*K:(g+1)*K] @ W_g^T`` (FP32 accumulation, one rounding
+    to ``out_dtype``). M <= GEMV_MAX_M: one grouped GEMV launch; above: the exact FP16 weight + one cuBLAS bmm."""
+    _check_grouped(x, w, groups)
+    m = x.shape[0]
+    if m <= GEMV_MAX_M:
+        return fp8_g32_gemv(x, w, out_dtype=out_dtype, out=out, groups=groups)
+    out = _out(x, w, out_dtype, out)
+    ng = w.n // groups
+    dense = dequant_fp8_g32(w).view(w.k, groups, ng).permute(1, 0, 2)          # [g, K, Ng]
+    z = torch.bmm(x.view(m, groups, w.k).transpose(0, 1), dense, out_dtype=torch.float32)   # [g, M, Ng]
+    out.view(m, groups, ng).copy_(z.transpose(0, 1))
+    return out
+
+
 def dequant_fp8_g32_reference(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Exact FP32 dequantisation of E4M3 [N, K] with block-32 scales (the FP16 fallback's values)."""
     if weight.dtype in (torch.uint8, torch.int8):
@@ -277,9 +355,20 @@ def dequant_fp8_g32_reference(weight: torch.Tensor, scale: torch.Tensor) -> torc
     return weight.float() * s[: weight.shape[0], : weight.shape[1]].to(weight.device)
 
 
-def _check_x(x: torch.Tensor, w: Fp8G32Weight) -> None:
-    if x.dtype != torch.float16 or x.ndim != 2 or x.shape[1] != w.k or (x.shape[0] and x.stride(1) != 1):
-        raise TypeError(f"fp8_g32: x must be a row-major fp16 [M, {w.k}] matrix, got {x.dtype} {tuple(x.shape)}")
+def _check_x(x: torch.Tensor, w: Fp8G32Weight, allow_fp32: bool = False) -> None:
+    dtypes = (torch.float16, torch.float32) if allow_fp32 else (torch.float16,)
+    if x.dtype not in dtypes or x.ndim != 2 or x.shape[1] != w.k or (x.shape[0] and x.stride(1) != 1):
+        raise TypeError(f"fp8_g32: x must be a row-major {'/'.join(str(d) for d in dtypes)} [M, {w.k}] matrix, "
+                        f"got {x.dtype} {tuple(x.shape)}")
+
+
+def _check_grouped(x: torch.Tensor, w: Fp8G32Weight, groups: int) -> None:
+    if groups < 1 or w.n % (groups * PANEL):
+        raise ValueError(f"fp8_g32: {groups} groups do not split N={w.n} into 32-row panels")
+    if (x.dtype != torch.float16 or x.ndim != 2 or x.shape[1] != groups * w.k
+            or (x.shape[0] and x.stride(1) != 1)):
+        raise TypeError(f"fp8_g32 grouped: x must be a row-major fp16 [M, {groups} * {w.k}] matrix, got {x.dtype} "
+                        f"{tuple(x.shape)}")
 
 
 def _out(x: torch.Tensor, w: Fp8G32Weight, out_dtype: torch.dtype, out: torch.Tensor | None) -> torch.Tensor:

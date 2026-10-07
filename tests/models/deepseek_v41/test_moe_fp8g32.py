@@ -163,8 +163,11 @@ def test_refuses_inexact_scales_and_shapes():
     with pytest.raises(ValueError, match="N % 32"):
         fp8_g32.prepare_fp8_g32(w[:200], s[:7])
     tw = fp8_g32.prepare_fp8_g32(w, s)
-    with pytest.raises(TypeError, match="fp16"):
-        fp8_g32.fp8_g32_linear(torch.randn(2, 1024, device="cuda"), tw)
+    # FP32 x is a GEMV-only input (P5-MOE: indexer q); TurboMind / dequant paths and other dtypes refuse it
+    with pytest.raises(TypeError, match="float16"):
+        fp8_g32.fp8_g32_linear(torch.randn(16, 1024, device="cuda"), tw)
+    with pytest.raises(TypeError, match="float16"):
+        fp8_g32.fp8_g32_linear(torch.randn(2, 1024, device="cuda").bfloat16(), tw)
 
 
 @pytest.mark.parametrize("exp", [-14, 7])
