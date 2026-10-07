@@ -56,6 +56,7 @@ LAYER_SUBSET_ALLOW_KNOB = "VLLM_DS41_CORE_ALLOW_LAYER_SUBSET"   # must be 1 too:
 # L-ATTN's cross-stage KV-mirror check (ds41/attn kv_mirror.py MIRROR_CHECK_ENV / PP_KEY_KV20_CRC; contracts.py is
 # frozen, so the extra payload key lives here and is cross-checked against kv_mirror when the knob is on)
 MIRROR_CHECK_KNOB = "VLLM_DS41_ATTN_MIRROR_CHECK"
+HC_FUSED_KNOB = "VLLM_DS41_CORE_HC_FUSED"     # 1 (default): fused Triton HC kernels on CUDA (sm70/hc_kernels.py)
 KV20_CRC_KEY = "kv20_crc"
 
 logger = init_logger(__name__)
@@ -211,6 +212,61 @@ class DeepseekV41DecoderLayer(nn.Module):
                 ds41_dump.dump(layer, name, t)
         return stream, ffn_pre
 
+    def forward_fused(self, stream: torch.Tensor, pre_in: torch.Tensor, positions: torch.Tensor,
+                      pending: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+                      ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
+        """Same math as forward() through sm70/hc_kernels.py (two launches per HC step). Single-pass shift:
+        the previous layer's FFN hc_post arrives as ``pending`` (moe_out, post, comb) and is fused with this layer's
+        attention mixes + collapse; this layer's FFN post is returned as the new ``pending`` (the model applies the
+        last one). While dumping, every layer applies its own FFN post so stream_out exists (no shift)."""
+        from .hc_kernels import hc_fused_step
+
+        dumping = ds41_dump.ENABLED
+        layer = self.layer_id
+        if pending is not None and self.engram is not None:      # Engram reads the full stream: apply the post
+            stream = hc_fused_step(stream, sub_out=pending[0], post=pending[1], comb=pending[2])[0]
+            pending = None
+        if dumping:
+            assert pending is None
+            ds41_dump.dump(layer, "stream_in", stream)
+            ds41_dump.dump(layer, "pre_in", pre_in)
+        if self.engram is not None:
+            stream = self.engram(stream, positions)
+            if dumping:
+                ds41_dump.dump(layer, "engram.out", stream)
+        attn_mix = (self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        if pending is None:
+            stream, mixes, x, collapsed = hc_fused_step(stream, mix=attn_mix, collapse_pre=pre_in,
+                                                        norm_weight=self.attn_norm.weight)
+        else:
+            stream, mixes, x, collapsed = hc_fused_step(stream, sub_out=pending[0], post=pending[1],
+                                                        comb=pending[2], mix=attn_mix, collapse_pre=pre_in,
+                                                        norm_weight=self.attn_norm.weight)
+        assert mixes is not None and x is not None
+        attn_pre, attn_post, attn_comb = mixes
+        attn_out = self.attn(positions, x).contiguous()
+        if dumping:
+            for name, t in (("hc.attn_pre", attn_pre), ("hc.attn_post", attn_post), ("hc.attn_comb", attn_comb),
+                            ("hc.attn_x", collapsed), ("attn.x", x), ("attn.out", attn_out)):
+                ds41_dump.dump(layer, name, t)
+        stream, mixes, x, collapsed = hc_fused_step(
+            stream, sub_out=attn_out, post=attn_post, comb=attn_comb,
+            mix=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base), collapse_pre=attn_pre,
+            norm_weight=self.ffn_norm.weight)
+        assert mixes is not None and x is not None
+        ffn_pre, ffn_post, ffn_comb = mixes
+        if dumping:
+            for name, t in (("stream_attn", stream), ("hc.ffn_pre", ffn_pre), ("hc.ffn_post", ffn_post),
+                            ("hc.ffn_comb", ffn_comb), ("hc.ffn_x", collapsed), ("moe.x", x)):
+                ds41_dump.dump(layer, name, t)
+        moe_out = self.ffn(x).contiguous()
+        if not dumping:
+            return stream, ffn_pre, (moe_out, ffn_post, ffn_comb)
+        stream = hc_fused_step(stream, sub_out=moe_out, post=ffn_post, comb=ffn_comb)[0]
+        for name, t in (("moe.out", moe_out), ("stream_out", stream), ("pre_out", ffn_pre)):
+            ds41_dump.dump(layer, name, t)
+        return stream, ffn_pre, None
+
 
 class DeepseekV41Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -236,6 +292,7 @@ class DeepseekV41Model(nn.Module):
         partition = pipeline_partition(config.num_hidden_layers, pp.world_size)
         self.stage = make_stage_plan(config, pp.rank_in_group, pp.world_size, partition)
         self.layer_subset = parse_layer_subset(self.stage, config)
+        self.hc_fused = knobs.env_bool(HC_FUSED_KNOB, True)    # used on CUDA streams only (CPU: common/hc.py)
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         device = torch.get_default_device()
         self.shared = allocate_shared_attn_buffers(max_tokens, self.stage, device)
@@ -356,10 +413,22 @@ class DeepseekV41Model(nn.Module):
                 self.mirror.ingest(positions, intermediate_tensors[C.PP_KEY_KV20_CKV],
                                    intermediate_tensors[C.PP_KEY_KV20_IK], intermediate_tensors[C.PP_KEY_CAND20],
                                    crc=intermediate_tensors[KV20_CRC_KEY] if self.kv20_crc_check else None)
+        fused = self.hc_fused and stream.is_cuda
+        pending: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         for layer in self.layers[self.start_layer:self.end_layer]:
             if isinstance(layer, PPMissingLayer):   # layer outside the configured subset
                 continue
-            stream, pre = layer(stream, pre, positions)
+            if fused:
+                stream, pre, pending = layer.forward_fused(stream, pre, positions, pending)
+            else:
+                stream, pre = layer(stream, pre, positions)
+        if pending is not None:
+            from .hc_kernels import hc_fused_step
+
+            if self.pp_is_last:     # last FFN post fused with the final collapse + norm (no dump: pending is None)
+                return hc_fused_step(stream, sub_out=pending[0], post=pending[1], comb=pending[2],
+                                     collapse_pre=pre, norm_weight=self.norm.weight)[2]
+            stream = hc_fused_step(stream, sub_out=pending[0], post=pending[1], comb=pending[2])[0]
         if not self.pp_is_last:
             num_tokens = stream.shape[0]
             out = {C.PP_KEY_HIDDEN: stream, C.PP_KEY_PRE_MIX: pre}
