@@ -12483,6 +12483,23 @@ class GPUModelRunner(
                 cg_support = builder_cls.get_cudagraph_support(
                     self.vllm_config, kv_cache_group.kv_cache_spec
                 )
+                # V4.1's entire attention op is an eager break. NEVER applies
+                # to monolithic capture, not the surrounding breakable graph.
+                if (
+                    cg_support == AttentionCGSupport.NEVER
+                    and is_breakable_cudagraph_enabled()
+                    and "DeepseekV41ForCausalLM" in self.model_config.architectures
+                    and attn_backend.__module__
+                    == "vllm.models.deepseek_v41.sm70.sparse"
+                ):
+                    if (
+                        self.compilation_config.cudagraph_mode
+                        != CUDAGraphMode.NONE
+                    ):
+                        self.compilation_config.cudagraph_mode = (
+                            CUDAGraphMode.PIECEWISE
+                        )
+                    cg_support = AttentionCGSupport.ALWAYS
                 if cg_support.value < min_cg_support.value:
                     min_cg_support = cg_support
                     min_cg_attn_backend = attn_backend.__name__
