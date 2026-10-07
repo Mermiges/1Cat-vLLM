@@ -49,6 +49,20 @@ def _prefill(st: Stage, reqs: dict[str, int]) -> None:
             p += c
 
 
+def test_decode_default_and_explicit_overrides(monkeypatch) -> None:
+    from vllm.models.deepseek_v41.sm70.sparse import decode_path_enabled
+
+    monkeypatch.delenv(DECODE_PATH_ENV, raising=False)
+    monkeypatch.setenv("VLLM_DS41_ATTN_IMPL", "sm70")
+    assert decode_path_enabled()
+    monkeypatch.setenv(DECODE_PATH_ENV, "0")
+    assert not decode_path_enabled()
+    monkeypatch.setenv(DECODE_PATH_ENV, "1")
+    assert decode_path_enabled()
+    monkeypatch.setenv("VLLM_DS41_ATTN_IMPL", "torch")
+    assert not decode_path_enabled()
+
+
 def test_decode_metadata_matches_general(dist_env, monkeypatch) -> None:
     cfg = ref_config()
     ids = (0, 2, 20)
@@ -57,7 +71,7 @@ def test_decode_metadata_matches_general(dist_env, monkeypatch) -> None:
         c = st.attn[i].compressor
         if c is not None:
             c.__dict__.pop("forward", None)
-    monkeypatch.delenv(DECODE_PATH_ENV, raising=False)
+    monkeypatch.setenv(DECODE_PATH_ENV, "0")
     assert DS41SWAMetadataBuilder.get_cudagraph_support(st.vcfg, None) == AttentionCGSupport.NEVER
     _prefill(st, {"a": 300, "b": 1501})
     batch = [("a", 300, 1), ("b", 1501, 1)]
@@ -101,7 +115,7 @@ def test_decode_metadata_matches_general(dist_env, monkeypatch) -> None:
 def test_padded_general_metadata(dist_env, monkeypatch) -> None:
     """Breakable PIECEWISE graphs pad mixed batches: the general path takes padding tokens (no request) as
     position 0 / slot -1 instead of refusing the batch."""
-    monkeypatch.delenv(DECODE_PATH_ENV, raising=False)
+    monkeypatch.setenv(DECODE_PATH_ENV, "0")
     cfg = ref_config()
     st = Stage(cfg, (2,), {2: synthetic_attn_weights(cfg, topology(cfg, 2), DEV, seed=2)})
     md, _ = st.sim.metadata([("a", 0, 5), ("b", 0, 1)], pad_tokens=8)

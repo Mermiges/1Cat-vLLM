@@ -202,11 +202,10 @@ DECODE_PATH_ENV = "VLLM_DS41_ATTN_DECODE_PATH"
 
 
 def decode_path_enabled() -> bool:
-    """Decode batches get builder-owned, graph-safe metadata (``decode=True``). OFF by default until the layers'
-    static-shape decode path consumes it (the general-path layers cannot); the torch oracle impl never uses it."""
+    """SM70 decode uses graph-safe metadata by default; the torch oracle uses general metadata."""
     if knobs.env_str("VLLM_DS41_ATTN_IMPL", "sm70", choices=("sm70", "torch")) == "torch":
         return False
-    return knobs.env_bool(DECODE_PATH_ENV, False)
+    return knobs.env_bool(DECODE_PATH_ENV, True)
 
 
 def _exact_seq_lens_cpu(cm: CommonAttentionMetadata) -> np.ndarray:
@@ -234,8 +233,7 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
     # P5-ATTN: uniform single-token decode batches get builder-owned, fixed-address metadata (decode=True) and the
     # layers' static-shape decode path, which FULL CUDA graphs capture; prefill / mixed batches keep the general
     # (host-dependent) path, which runs eagerly (breakable graphs: an eager break; PIECEWISE runtime mode).
-    # Until the layers' decode path lands (P5-ATTN handoff) the decode metadata is OFF by default
-    # (VLLM_DS41_ATTN_DECODE_PATH=0): the builders then declare NEVER and emit general metadata only.
+    # Explicit VLLM_DS41_ATTN_DECODE_PATH=0 disables decode metadata and graph support.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
     uses_physical_block_table: ClassVar[bool] = True
     DECODE_KIND: ClassVar[int] = KIND_SWA
