@@ -1329,12 +1329,14 @@ class Worker(WorkerBase):
             }
 
         engram_service = self._engram_service() if forward_pass else None
+        engram_step_id: int | None = None
         if engram_service is not None:
             # Before the PP receive: this stage's Engram row gathers overlap the
             # previous stage's compute (PORT_DESIGN §3.6).
             plan = self._engram_planner.plan(scheduler_output)
             self.model_runner._engram_step_id = plan.step_id
             engram_service.begin_step(plan)
+            engram_step_id = plan.step_id
 
         if forward_pass and not get_pp_group().is_first_rank:
             schema_recv = self._schema_static_pp_recv(num_scheduled_tokens)
@@ -1368,20 +1370,27 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
-            if (
-                self.use_v2_model_runner
-                and self.model_runner.is_pooling_model
-                and output is None
-            ):
-                output = self.model_runner.pool()  # type: ignore
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
+        try:
+            with self.annotate_profile(scheduler_output):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+                if (
+                    self.use_v2_model_runner
+                    and self.model_runner.is_pooling_model
+                    and output is None
+                ):
+                    output = self.model_runner.pool()  # type: ignore
+                if isinstance(
+                    output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+                ):
+                    return output
+        finally:
+            # D11 ENGRAM F2: the forward (and every wait_rows in it) has been
+            # issued; retire this step's gather so its slot/tickets are free.
+            # Also on an exception, so an aborted step never pins its slot.
+            if engram_step_id is not None:
+                engram_service.end_step(engram_step_id)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config

@@ -258,3 +258,62 @@ def test_refusal_runs_after_mode_resolution() -> None:
     src = inspect.getsource(GPUModelRunner)
     resolve = src.index("self._check_and_update_cudagraph_mode(")
     assert src.index("self._refuse_full_cudagraphs_with_engram()", resolve) > resolve
+
+
+# ---------------------------------------------------------------- D11 ENGRAM F2: end_step
+class _RecordingEngram:
+    def __init__(self, log: list) -> None:
+        self.log = log
+
+    def begin_step(self, plan) -> None:
+        self.log.append(("begin", plan.step_id))
+
+    def end_step(self, step_id: int) -> None:
+        self.log.append(("end", step_id))
+
+
+def _engram_worker(monkeypatch, log: list, forward):
+    import contextlib
+
+    monkeypatch.setattr(gpu_worker, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True))
+    worker = Worker.__new__(Worker)
+    worker.vllm_config = _vllm_config(pp=1)
+    worker._pp_send_work = []
+    worker.use_v2_model_runner = False
+    worker.annotate_profile = lambda so: contextlib.nullcontext()
+    service = _RecordingEngram(log)
+    worker._engram_service = lambda: service
+    worker._engram_planner = SimpleNamespace(plan=lambda so: SimpleNamespace(step_id=7))
+
+    def execute_model(so, it):
+        log.append(("forward", worker.model_runner._engram_step_id))
+        return forward()
+
+    worker.model_runner = SimpleNamespace(execute_model=execute_model, _engram_step_id=-1)
+    return worker
+
+
+def test_end_step_after_each_real_forward(monkeypatch) -> None:
+    log: list = []
+    worker = _engram_worker(monkeypatch, log, lambda: None)
+    assert Worker.execute_model.__wrapped__(worker, SimpleNamespace(total_num_scheduled_tokens=3)) is None
+    assert log == [("begin", 7), ("forward", 7), ("end", 7)]
+
+
+def test_end_step_runs_when_forward_raises(monkeypatch) -> None:
+    log: list = []
+
+    def boom():
+        raise RuntimeError("forward failed")
+
+    worker = _engram_worker(monkeypatch, log, boom)
+    with pytest.raises(RuntimeError, match="forward failed"):
+        Worker.execute_model.__wrapped__(worker, SimpleNamespace(total_num_scheduled_tokens=3))
+    assert log == [("begin", 7), ("forward", 7), ("end", 7)]
+
+
+def test_no_engram_step_without_scheduled_tokens(monkeypatch) -> None:
+    log: list = []
+    worker = _engram_worker(monkeypatch, log, lambda: None)
+    Worker.execute_model.__wrapped__(worker, SimpleNamespace(total_num_scheduled_tokens=0))
+    assert log == [("forward", -1)]
