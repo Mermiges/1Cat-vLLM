@@ -99,5 +99,6 @@ def test_vllm_model_config_parses_official_checkpoint(ds41_checkpoint_dir: Path)
     mc = ModelConfig(model=str(ds41_checkpoint_dir), dtype="half", skip_tokenizer_init=True, max_model_len=32768)
     assert mc.architectures == ["DeepseekV41ForCausalLM"] and mc.quantization == "deepseek_v41_fp8"
     assert mc.dtype == torch.float16 and mc.is_moe and mc.hf_text_config is mc.hf_config
+    assert mc.tokenizer_mode == "deepseek_v41"          # auto-selected for the architecture
     cls, arch = ModelRegistry.resolve_model_cls(mc.architectures, mc)
     assert cls.__module__ == "vllm.models.deepseek_v41.sm70.model" and cls.supports_pp
