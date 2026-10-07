@@ -95,3 +95,24 @@ def verified_shard(ds41_checkpoint_dir: Path):
         return path
 
     return _verify
+
+
+@pytest.fixture
+def ds41_dist_single():
+    """World size 1 (TP 1, PP 1) on gloo so vLLM parallel layers can be built in-process on CPU or one GPU.
+    Function-scoped: the root conftest's autouse ``cleanup_fixture`` tears the groups down after every test."""
+    import socket
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import init_distributed_environment, initialize_model_parallel
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+    if not model_parallel_is_initialized():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        with set_current_vllm_config(VllmConfig()):
+            init_distributed_environment(world_size=1, rank=0, local_rank=0, backend="gloo",
+                                         distributed_init_method=f"tcp://127.0.0.1:{port}")
+            initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    yield
