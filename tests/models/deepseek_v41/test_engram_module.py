@@ -432,7 +432,10 @@ def _golden_cases() -> list[Path]:
     if GOLDEN_DIR.is_dir():
         for m in sorted(GOLDEN_DIR.glob("*/manifest.json")):
             man = json.load(open(m))
-            if man.get("engram_applied") and not man.get("provisional") and man.get("mode") == "v100-semantic":
+            # "greedy" cases (L-REF final batch, 03:22Z) hold only final-logit tensors over prompt + continuation
+            # (no token_ids/start_pos, no per-layer files): the Engram layer goldens live in prefill/decode cases.
+            if (man.get("engram_applied") and not man.get("provisional") and man.get("mode") == "v100-semantic"
+                    and man.get("phase") != "greedy"):
                 out.append(m.parent)
     return out
 
