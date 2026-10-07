@@ -6546,9 +6546,9 @@ class GPUModelRunner(
         model = self.get_model() if hasattr(self, "model") else None
         service = getattr(model, "engram_service", None)
         if service is not None and self.use_async_scheduling:
-            raise NotImplementedError(
-                "DeepSeek-V4.1 Engram needs synchronous scheduling at P2 (PORT_DESIGN A9)"
-            )
+            from vllm.models.deepseek_v41.common.async_pp import require_async_pp
+
+            require_async_pp(self.vllm_config)
         self._engram_bind_service_cache = service
         return service
 
@@ -6582,7 +6582,22 @@ class GPUModelRunner(
             )
         self._engram_step_id = None
         sampled_fill = None
-        if get_pp_group().world_size == 1:
+        if (
+            get_pp_group().world_size > 1
+            and getattr(self, "use_async_scheduling", False)
+        ):
+            if not hasattr(self, "_engram_unknown_req_ids"):
+                raise RuntimeError("Engram async PP is missing the worker's token plan")
+            required = self._engram_unknown_req_ids
+            received = getattr(self, "_engram_prev_sampled", None)
+            if required and received is None:
+                raise RuntimeError("Engram async PP decode has no sampled-id handoff")
+            if received is not None:
+                sampled_fill = received.for_batch(
+                    tuple(self.input_batch.req_ids[:num_reqs]), required
+                )
+            self._engram_prev_sampled = None
+        elif get_pp_group().world_size == 1:
             # The sampling rank owns Engram: under synchronous scheduling the token
             # at each request's first scheduled position is already in token_ids_cpu.
             rows = np.arange(num_reqs)
@@ -9895,6 +9910,16 @@ class GPUModelRunner(
                     recv, src=pp.last_rank, group=pp.device_group
                 )
             self.input_batch.prev_sampled_token_ids = recv
+
+        if self._engram_bind_service() is not None and self.use_async_scheduling:
+            from vllm.models.deepseek_v41.common.async_pp import SampledPPIds
+
+            self._engram_prev_sampled = None
+            if not self._is_all_reqs_chunked_prefill():
+                self._engram_prev_sampled = SampledPPIds.receive(
+                    self.input_batch.prev_sampled_token_ids,
+                    tuple(self.input_batch.req_ids[:num_reqs]),
+                )
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row

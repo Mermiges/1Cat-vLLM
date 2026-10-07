@@ -286,7 +286,9 @@ def _engram_worker(monkeypatch, log: list, forward):
     worker.annotate_profile = lambda so: contextlib.nullcontext()
     service = _RecordingEngram(log)
     worker._engram_service = lambda: service
-    worker._engram_planner = SimpleNamespace(plan=lambda so: SimpleNamespace(step_id=7))
+    worker._engram_planner = SimpleNamespace(
+        plan=lambda so: SimpleNamespace(step_id=7, reqs=())
+    )
 
     def execute_model(so, it):
         log.append(("forward", worker.model_runner._engram_step_id))

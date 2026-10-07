@@ -1269,10 +1269,9 @@ class Worker(WorkerBase):
                     "GPUModelRunner; unset VLLM_USE_V2_MODEL_RUNNER"
                 )
             if self.vllm_config.scheduler_config.async_scheduling:
-                raise NotImplementedError(
-                    "DeepSeek-V4.1 Engram needs synchronous scheduling at P2 (PORT_DESIGN A9); "
-                    "launch with --no-async-scheduling"
-                )
+                from vllm.models.deepseek_v41.common.async_pp import require_async_pp
+
+                require_async_pp(self.vllm_config)
             self._engram_planner = _EngramStepPlanner()
         self._engram_service_cache = service
         return service
@@ -1335,6 +1334,9 @@ class Worker(WorkerBase):
             # previous stage's compute (PORT_DESIGN §3.6).
             plan = self._engram_planner.plan(scheduler_output)
             self.model_runner._engram_step_id = plan.step_id
+            self.model_runner._engram_unknown_req_ids = frozenset(
+                r.req_id for r in plan.reqs if r.token_ids is None
+            )
             engram_service.begin_step(plan)
             engram_step_id = plan.step_id
 
