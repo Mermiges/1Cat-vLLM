@@ -6552,6 +6552,20 @@ class GPUModelRunner(
         self._engram_bind_service_cache = service
         return service
 
+    def _refuse_full_cudagraphs_with_engram(self) -> None:
+        """PORT_DESIGN §9 AM-11c: a stage with Engram layers runs breakable graphs only.
+        Checked after the cudagraph mode is resolved (attention builders may have
+        downgraded a requested FULL mode)."""
+        if self._engram_bind_service() is None:
+            return
+        mode = self.compilation_config.cudagraph_mode
+        if mode is not None and mode.has_full_cudagraphs():
+            raise ValueError(
+                f"cudagraph_mode={mode.name} captures FULL CUDA graphs, but this "
+                "DeepSeek-V4.1 stage owns Engram layers (host row gathers are eager "
+                "breaks): use breakable/PIECEWISE graphs or --enforce-eager"
+            )
+
     def _engram_batch_layout(
         self, num_reqs: int, num_tokens: int, num_tokens_padded: int
     ) -> Any:
@@ -12399,6 +12413,7 @@ class GPUModelRunner(
             kv_cache_config.kv_cache_groups,
             is_profiling=is_profiling,
         )
+        self._refuse_full_cudagraphs_with_engram()
 
         # Check if attention backend supports PCP&DCP and related features.
         check_attention_cp_compatibility(self.vllm_config)

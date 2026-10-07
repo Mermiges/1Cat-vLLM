@@ -230,3 +230,31 @@ def test_runner_layout_sampling_rank_fills_tokens(monkeypatch) -> None:
     fill, event = layout.sampled_fill
     assert fill.is_pinned() and fill.dtype == torch.int32 and fill.tolist() == [15, 23]
     event.synchronize()
+
+
+@pytest.mark.parametrize("mode, refused", [(CUDAGraphMode.FULL, True), (CUDAGraphMode.FULL_AND_PIECEWISE, True),
+                                           (CUDAGraphMode.FULL_DECODE_ONLY, True), (CUDAGraphMode.PIECEWISE, False),
+                                           (CUDAGraphMode.NONE, False)])
+def test_full_cudagraphs_refused_on_engram_stage(mode, refused) -> None:
+    """MC-CORE F4 / AM-11c: FULL graph modes are refused when the stage owns Engram layers (after mode resolution)."""
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    for service, expect in ((object(), refused), (None, False)):
+        runner = GPUModelRunner.__new__(GPUModelRunner)
+        runner._engram_bind_service_cache = service
+        runner.compilation_config = SimpleNamespace(cudagraph_mode=mode)
+        if expect:
+            with pytest.raises(ValueError, match="Engram"):
+                runner._refuse_full_cudagraphs_with_engram()
+        else:
+            runner._refuse_full_cudagraphs_with_engram()
+
+
+def test_refusal_runs_after_mode_resolution() -> None:
+    import inspect
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    src = inspect.getsource(GPUModelRunner)
+    resolve = src.index("self._check_and_update_cudagraph_mode(")
+    assert src.index("self._refuse_full_cudagraphs_with_engram()", resolve) > resolve
