@@ -335,6 +335,21 @@ def test_engram_unconsumed_tensor_raises(loaded_model, monkeypatch) -> None:
                             ("layers.1.engram.q_weight", torch.zeros(1))])
 
 
+def test_engram_may_report_completed_params(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
+    """L-INTEG: the real L-ENGRAM module returns consumed checkpoint names PLUS the parameters it completed
+    ('wkv_r', 'qk'); L-CORE accepts the module's own parameter names but still raises on any other unknown name."""
+    for extra, ok in (({"wkv_r", "qk"}, True), ({"not_a_param"}, False)):
+        model, _ = _build(ds41_checkpoint_dir, monkeypatch)
+        engram = model.model.layers[1].engram
+        real = engram.load_weights
+        monkeypatch.setattr(engram, "load_weights", lambda items, real=real, extra=extra: set(real(items)) | extra)
+        if ok:
+            model.load_weights(_weights_for({0, 1, 2, 3}))
+        else:
+            with pytest.raises(RuntimeError, match="unknown"):
+                model.load_weights(_weights_for({0, 1, 2, 3}))
+
+
 def test_dummy_flag_reaches_engram(loaded_model) -> None:
     """PORT_DESIGN §9 AM-2: the model sees ForwardContext.is_dummy_run (True only in GPUModelRunner._dummy_run)."""
     from vllm.forward_context import set_forward_context
