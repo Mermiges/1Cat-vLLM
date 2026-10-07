@@ -11,6 +11,7 @@ from vllm.models.deepseek_v41.sm70.dspark import (
     DSparkDeepseekV41ForCausalLM as Draft,
 )
 from vllm.models.deepseek_v41.sm70.dspark import (
+    DSparkMetadata,
     DSparkMetadataBuilder,
     capture_target_input,
     configure_target_capture,
@@ -53,6 +54,29 @@ def test_noncausal_same_context_and_all_queries(anchor, monkeypatch):
         assert torch.equal(md.window_slots[r * 5 : r * 5 + 5], row.expand(5, -1))
     with pytest.raises(ValueError, match="noncausal"):
         builder.build_for_drafting(replace(cm, causal=True), 0)
+    # Target forward builds the draft group too, with arbitrary causal query
+    # lengths. Those unused entries must never masquerade as draft metadata.
+    target = builder.build(
+        0, replace(cm, causal=True, query_start_loc_cpu=torch.tensor([0, 4, 10]))
+    )
+    assert not isinstance(target, DSparkMetadata)
+    assert target.window_slots.shape == (10, 128)
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.deepseek_v41.sm70.dspark import DSparkAttention
+
+    attn = object.__new__(DSparkAttention)
+    nn.Module.__init__(attn)
+    attn.swa_cache = SimpleNamespace(layer_name="draft")
+    attn._qkv = lambda x: (torch.zeros(10, 1, 512), torch.zeros(10, 512))
+    with (
+        override_forward_context(
+            ForwardContext(
+                no_compile_layers={}, attn_metadata={"draft": target}, slot_mapping={}
+            )
+        ),
+        pytest.raises(TypeError, match="noncausal metadata backend"),
+    ):
+        attn(torch.arange(10), torch.zeros(10, 5120))
     with pytest.raises(ValueError, match="five queries"):
         builder.build_for_drafting(
             replace(cm, query_start_loc_cpu=torch.tensor([0, 4, 10])), 0

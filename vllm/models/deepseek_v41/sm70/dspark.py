@@ -117,15 +117,24 @@ class DSparkMetadataBuilder(DS41SWAMetadataBuilder):
     ) -> AttentionCGSupport:
         return AttentionCGSupport.NEVER
 
+    def build_for_drafting(
+        self, common_attn_metadata: CommonAttentionMetadata, draft_index: int
+    ) -> DS41SWAMetadata:
+        if common_attn_metadata.causal:
+            raise ValueError("V4.1 DSpark requires noncausal draft metadata")
+        return self.build(0, common_attn_metadata, fast_build=True)
+
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> DSparkMetadata:
+    ) -> DS41SWAMetadata:
         cm = common_attn_metadata
         if cm.causal:
-            raise ValueError("V4.1 DSpark requires noncausal draft metadata")
+            # The target runner builds every cache group, including unused draft
+            # groups. Keep causal metadata distinct; DSparkAttention rejects it.
+            return super().build(common_prefix_len, cm, fast_build)
         # DFlash's CPU upper bound includes rejected tokens. Synchronous draft
         # lengths must come from the corrected GPU seq_lens, never that bound.
         exact = cm.seq_lens.detach().cpu()
