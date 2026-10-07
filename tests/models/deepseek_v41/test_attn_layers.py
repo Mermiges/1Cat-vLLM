@@ -80,7 +80,7 @@ class Stage:
 
     def __init__(self, cfg, layer_ids, weights, *, stage: StagePlan | None = None, mirror: bool = False,
                  max_model_len: int = 65536, max_tokens: int = 4096, num_blocks: int = 512, seed: int = 0,
-                 tp_rank: int = 0, tp_size: int = 1):
+                 tp_rank: int = 0, tp_size: int = 1, layers_prefix: str = "model.layers"):
         from vllm.models.deepseek_v41.attention import DeepseekV41Attention
         from vllm.models.deepseek_v41.kv_mirror import DeepseekV41KVSourceMirror
         self.cfg = cfg
@@ -89,7 +89,7 @@ class Stage:
         self.shared = allocate_shared_attn_buffers(max_tokens, self.stage, DEV)
         self.layer_ids = list(layer_ids)
         with _fp16_default():
-            self.attn = {i: DeepseekV41Attention(self.vcfg, f"model.layers.{i}.attn", topology(cfg, i), self.stage,
+            self.attn = {i: DeepseekV41Attention(self.vcfg, f"{layers_prefix}.{i}.attn", topology(cfg, i), self.stage,
                                                  self.shared) for i in self.layer_ids}
             self.mirror = DeepseekV41KVSourceMirror(self.vcfg, 20, self.shared) if mirror else None
         for i in self.layer_ids:

@@ -14,6 +14,8 @@ import torch
 
 from vllm.models.deepseek_v41.common.contracts import CAND_ALL, StagePlan
 
+from vllm.models.deepseek_v41.kv_mirror import kv20_crc
+
 from .test_attn_harness import layer_inputs, ref_config, synthetic_attn_weights, topology
 from .test_attn_layers import DEV, Stage, dist_env  # noqa: F401  (fixture)
 
@@ -47,7 +49,7 @@ def _run(S: int, chunks: list[int], check_env: bool, monkeypatch) -> None:
         s2.step(batch, inputs, out_pp, export=exported)
         ckv, ik, cand, _ = exported[0]
         saw_real_candidates |= bool((cand[:, 0] != CAND_ALL).any())
-        s3.step(batch, inputs, out_pp, payload=(ckv, ik, cand))
+        s3.step(batch, inputs, out_pp, payload=(ckv, ik, cand, kv20_crc(ckv, ik) if check_env else None))
         pos += n
         # mirror rows == source rows, bit for bit, for every compressed entry written so far (ratio 1)
         for name in SRC:
