@@ -278,7 +278,7 @@ def _pp_fake(stage_kwargs: dict, **attrs):
     from vllm.models.deepseek_v41.sm70.model import DeepseekV41Model
 
     fake = SimpleNamespace(stage=SimpleNamespace(**stage_kwargs), pp_is_first=False, pp_is_last=False, layers=[],
-                           start_layer=0, end_layer=0, **attrs)
+                           start_layer=0, end_layer=0, hc_fused=False, **attrs)
     fake.forward = functools.partial(DeepseekV41Model.forward, fake)
     return fake
 
