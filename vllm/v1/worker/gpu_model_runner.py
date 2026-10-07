@@ -6538,6 +6538,51 @@ class GPUModelRunner(
 
         return tuple(tasks)
 
+    def _engram_bind_service(self) -> Any | None:
+        """The model's Engram host service (DeepSeek-V4.1), or None; resolved once."""
+        cached = getattr(self, "_engram_bind_service_cache", False)
+        if cached is not False:
+            return cached
+        model = self.get_model() if hasattr(self, "model") else None
+        service = getattr(model, "engram_service", None)
+        if service is not None and self.use_async_scheduling:
+            raise NotImplementedError(
+                "DeepSeek-V4.1 Engram needs synchronous scheduling at P2 (PORT_DESIGN A9)"
+            )
+        self._engram_bind_service_cache = service
+        return service
+
+    def _engram_batch_layout(
+        self, num_reqs: int, num_tokens: int, num_tokens_padded: int
+    ) -> Any:
+        from vllm.models.deepseek_v41.common.contracts import EngramBatchLayout
+
+        step_id = getattr(self, "_engram_step_id", None)
+        if step_id is None:
+            raise RuntimeError(
+                "Engram bind_batch without a begin_step for this step (worker hook missing)"
+            )
+        self._engram_step_id = None
+        sampled_fill = None
+        if get_pp_group().world_size == 1:
+            # The sampling rank owns Engram: under synchronous scheduling the token
+            # at each request's first scheduled position is already in token_ids_cpu.
+            rows = np.arange(num_reqs)
+            cols = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            ids = self.input_batch.token_ids_cpu[rows, cols].astype(np.int32)
+            fill = torch.from_numpy(ids).pin_memory()
+            ready = torch.cuda.Event()
+            ready.record()
+            sampled_fill = (fill, ready)
+        return EngramBatchLayout(
+            step_id=step_id,
+            req_order=tuple(self.input_batch.req_ids[:num_reqs]),
+            query_start_loc=self.query_start_loc.np[: num_reqs + 1].astype(np.int32),
+            num_tokens=num_tokens,
+            num_tokens_padded=num_tokens_padded,
+            sampled_fill=sampled_fill,
+        )
+
     def sync_and_gather_intermediate_tensors(
         self,
         num_tokens: int,
@@ -8674,6 +8719,16 @@ class GPUModelRunner(
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )
+            engram_service = self._engram_bind_service()
+            if engram_service is not None:
+                # DeepSeek-V4.1 Engram (PORT_DESIGN §3.6 hook 2): batch order,
+                # query_start_loc and padding are final; the forward has not
+                # started, so the row assembly + H2D overlap the step's setup.
+                engram_service.bind_batch(
+                    self._engram_batch_layout(
+                        num_reqs, num_tokens_unpadded, num_tokens_padded
+                    )
+                )
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
