@@ -374,7 +374,13 @@ def post_wkv_gate_torch_(stream: torch.Tensor, kv: torch.Tensor, qk: torch.Tenso
 # ------------------------------------------------------------------------------------------------ module
 def _wait_rows_eager(service: EngramHostService, layer_id: int, out: torch.Tensor) -> None:
     """The Engram eager break (PORT_DESIGN §1 CUDA-graph row): CPU wait for this step's rows + stream wait, written
-    into the service's static device buffer ``out`` (the same address on every replay)."""
+    into the service's static device buffer ``out`` (the same address on every replay).
+
+    It must never be captured: in FULL cudagraph mode ``eager_break_during_capture`` runs the function inline, and a
+    captured wait would replay the capture-time rows (zeros) on every step -- silently disabling Engram."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(f"Engram layer {layer_id}: the row wait is being captured into a CUDA graph. It must run as "
+                           "an eager break (breakable cudagraph); FULL cudagraph mode cannot serve Engram rows.")
     rows = service.wait_rows(layer_id)
     if rows.data_ptr() != out.data_ptr() or rows.shape != out.shape:
         raise RuntimeError(f"Engram layer {layer_id}: service returned rows {tuple(rows.shape)} at "

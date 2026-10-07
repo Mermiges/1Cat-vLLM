@@ -220,6 +220,22 @@ def test_wkv_loader_exactness_and_refusals(syn: SyntheticEngram) -> None:
         svc.shutdown()
 
 
+def test_wait_refuses_cuda_graph_capture(syn: SyntheticEngram, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A FULL-mode capture of the Engram wait would replay zero rows forever: it must fail loudly instead."""
+    monkeypatch.setenv("VLLM_DS41_ENGRAM_IMPL", "sm70")
+    mod, svc = make_module(syn, 1, 0, 1, synthetic_wkv(14), max_tokens=8)
+    try:
+        svc.bind_batch(EngramBatchLayout(-1, (), np.zeros(1, np.int32), 0, 4, None))
+        stream = torch.zeros(4, 4, 5120, dtype=torch.bfloat16, device="cuda")
+        mod(stream, torch.arange(4, device="cuda"))          # eager dummy run is fine
+        g = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="captured into a CUDA graph"):
+            with torch.cuda.graph(g):
+                mod(stream, torch.arange(4, device="cuda"))
+    finally:
+        svc.shutdown()
+
+
 # ------------------------------------------------------------------------------ real weights (shards 47/48)
 def _verified_engram_shard(name: str) -> Path:
     p = ENGRAM_DIR / name
@@ -302,43 +318,95 @@ def test_module_real_weights_vs_reference(monkeypatch: pytest.MonkeyPatch, layer
 
 # ------------------------------------------------------------------------------ golden (L-REF) when present
 def _golden_cases() -> list[Path]:
-    if not GOLDEN_DIR.is_dir():
-        return []
-    return sorted(p.parent for p in GOLDEN_DIR.glob("*/manifest.json"))
+    """Final (non-provisional) L-REF cases with Engram applied, v100-semantic mode (the primary comparator)."""
+    import json
+
+    out = []
+    if GOLDEN_DIR.is_dir():
+        for m in sorted(GOLDEN_DIR.glob("*/manifest.json")):
+            man = json.load(open(m))
+            if man.get("engram_applied") and not man.get("provisional") and man.get("mode") == "v100-semantic":
+                out.append(m.parent)
+    return out
 
 
 @pytest.mark.weights
-@pytest.mark.parametrize("case", _golden_cases() or [None])
-def test_engram_vs_golden(case: Path | None) -> None:
-    """Hash ids vs the golden ``engram.hash`` (exact) and the dequantised rows vs ``engram.rows`` (exact)."""
+@pytest.mark.parametrize("case", _golden_cases() or [None], ids=lambda c: c.name if c else "none")
+def test_engram_vs_golden(case: Path | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per captured Engram layer: hash ids and dequantised rows bitwise; key/value (rel-RMS <= 1e-5) and gate
+    (|diff| <= 1e-5) from the module's own decode + FP16 GEMM path; module output stream vs the golden output.
+
+    The v100-semantic golden keeps the stream in FP32 while the port stores it in BF16 (PORT_DESIGN A4): BF16 rounding
+    alone is ~1.6e-3 rel-RMS, so the stream is compared against the golden rounded to BF16 (rel-RMS <= 1e-3) and the
+    raw FP32 metric is reported."""
     if case is None:
-        pytest.skip(f"no L-REF golden cases under {GOLDEN_DIR} yet")
+        pytest.skip(f"no final L-REF golden case with engram_applied under {GOLDEN_DIR} yet")
     import json
-
-    from safetensors.torch import load_file
-
-    from vllm.models.deepseek_v41.common.engram import EngramHasher, EngramLayout, load_compressed_token_map
-
-    man = json.load(open(case / "manifest.json"))
-    ref_dir = Path(tokenizer_path()).parent
     import types
 
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    from vllm.models.deepseek_v41.common.engram import (
+        DeepseekV41Engram, EngramHasher, EngramLayout, decode_rows_torch, load_compressed_token_map)
+    from vllm.models.deepseek_v41.common.engram_host import EngramHostService
+
+    monkeypatch.setenv("VLLM_DS41_ENGRAM_REQUIRE_VERIFIED", "1")
+    man = json.load(open(case / "manifest.json"))
+    ref_dir = Path(tokenizer_path()).parent
     hf = types.SimpleNamespace(**json.load(open(ref_dir / "config.json")))
     layout = EngramLayout.from_hf_config(hf)
     tmap = load_compressed_token_map(str(ref_dir), layout.compressed_vocab_size)
-    ids = np.asarray(man["token_ids"], np.int64)
+    hist = np.asarray(list(man.get("history_token_ids") or []) + list(man["token_ids"]), np.int64)
+    start, n = int(man["start_pos"]), int(man["num_tokens"])
+    assert hist.shape[0] == start + n, (hist.shape, start, n)
+    pos = np.arange(start, start + n)
     found = 0
-    for layer in (1, 14):
+    for layer, shard in ((1, "model-00047-of-00048.safetensors"), (14, "model-00048-of-00048.safetensors")):
         f = case / f"L{layer:02d}.safetensors"
         if not f.is_file():
             continue
         g = load_file(str(f))
         if "engram.hash" not in g:
             continue
-        h = EngramHasher(layout, tmap, (layer,), tuple(range(24)))
-        pos = np.asarray(man.get("positions", list(range(len(ids)))), np.int64)
-        got = h.hash_positions(h.compress(ids), pos)[:, 0]
-        np.testing.assert_array_equal(got, g["engram.hash"].numpy())
         found += 1
+        h = EngramHasher(layout, tmap, (layer,), tuple(range(24)))
+        np.testing.assert_array_equal(h.hash_positions(h.compress(hist), pos)[:, 0], g["engram.hash"].numpy())
+        path = _verified_engram_shard(shard)
+        svc = EngramHostService(hf, (layer,), 0, 1, str(ENGRAM_DIR), str(ref_dir), max(n, 8), torch.device("cuda"))
+        try:
+            with torch.device("cuda"):
+                mod = DeepseekV41Engram(None, f"model.layers.{layer}.engram", layer, svc)
+            with safe_open(str(path), framework="pt") as fh:
+                for name in ("wkv.weight", "wkv.scale", "q_weight", "k_weight"):
+                    mod.load_checkpoint_tensor(name, fh.get_tensor(f"layers.{layer}.engram.{name}"))
+            ids32 = hist.astype(np.int32)
+            svc.begin_step(EngramStepPlan(0, (EngramReqStep("g", start, n, ids32[start:], ids32),), frozenset()))
+            svc.bind_batch(EngramBatchLayout(0, ("g",), np.array([0, n], np.int32), n, n, None))
+            rows = svc.wait_rows(layer)
+            dec = decode_rows_torch(rows, svc.row_bias(layer)).float().cpu().view(n, 24, 256)
+            assert torch.equal(dec, g["engram.rows"].float()), "dequantised rows differ from the golden"
+            bias = svc.row_bias(layer)
+            kv = torch.mm(decode_rows_torch(rows, bias), mod.wkv_r.t(), out_dtype=torch.float32) * 2.0 ** -(10 + bias)
+            key, value = kv[:, :20480].view(n, 4, 5120).cpu(), kv[:, 20480:].cpu()
+            for name, ours in (("engram.key", key), ("engram.value", value)):
+                ref = g[name].float()
+                assert ((ours - ref).norm() / ref.norm()).item() <= 1e-5, name
+            h32 = g["stream_in"].float()
+            qk = mod.qk.cpu()
+            rstd = torch.rsqrt(h32.square().mean(-1) + 1e-20) * torch.rsqrt(key.square().mean(-1) + 1e-20)
+            dot = (h32 * qk * key).sum(-1) * rstd * 5120 ** -0.5
+            gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+            assert (gate - g["engram.gate"].float()).abs().max().item() <= 1e-5
+            stream = h32.to(torch.bfloat16).cuda()
+            out = mod(stream, torch.from_numpy(pos).cuda()).float().cpu()
+            gold = g["engram.out"].float()
+            gold16 = gold.to(torch.bfloat16).float()
+            rel16 = ((out - gold16).norm() / gold16.norm()).item()
+            rel32 = ((out - gold).norm() / gold.norm()).item()
+            print(f"{case.name} L{layer}: stream rel-RMS vs bf16(golden) {rel16:.2e}, vs FP32 golden {rel32:.2e}")
+            assert rel16 <= 1e-3 and (out - gold).abs().max().item() <= 1e-2 * gold.abs().max().item()
+        finally:
+            svc.shutdown()
     if not found:
         pytest.skip(f"{case}: no engram.hash tensors in this golden case")
