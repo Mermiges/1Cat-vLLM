@@ -11,6 +11,7 @@ are verified, and L-REF golden tensors when they exist.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -101,11 +102,11 @@ def make_module(syn: SyntheticEngram, layer: int, tp_rank: int, tp_size: int, wk
     with torch.device("cuda"):
         mod = DeepseekV41Engram(None, f"model.layers.{layer}.engram", layer, svc)
     w, s, q, k = wkv
-    assert mod.load_checkpoint_tensor("wkv.weight", torch.from_numpy(w).view(torch.float8_e4m3fn)) is None
-    assert mod.load_checkpoint_tensor("q_weight", q) is None
-    assert mod.load_checkpoint_tensor("wkv.scale", torch.from_numpy(s).view(torch.float8_e8m0fnu)) == "wkv_r"
-    assert mod.load_checkpoint_tensor("k_weight", k) == "qk"
-    assert mod.weights_loaded()
+    got = mod.load_weights([("wkv.weight", torch.from_numpy(w).view(torch.float8_e4m3fn)), ("q_weight", q),
+                            ("wkv.scale", torch.from_numpy(s).view(torch.float8_e8m0fnu)), ("k_weight", k)])
+    # AM-1: consumed names + completed parameters (vLLM checks every named parameter was loaded)
+    assert got == {"wkv.weight", "wkv.scale", "q_weight", "k_weight", "wkv_r", "qk"}
+    assert {n for n, _ in mod.named_parameters()} <= got and mod.weights_loaded()
     return mod, svc
 
 
@@ -202,6 +203,10 @@ def test_wkv_loader_exactness_and_refusals(syn: SyntheticEngram) -> None:
         mod.load_checkpoint_tensor("wkv.scale", torch.from_numpy(s))
         with pytest.raises(RuntimeError, match="twice"):
             mod.load_checkpoint_tensor("wkv.weight", torch.from_numpy(w))
+        with torch.device("cuda"):
+            half = DeepseekV41Engram(None, "model.layers.1.engram", 1, svc)
+        with pytest.raises(ValueError, match="not provided"):
+            half.load_weights([("q_weight", q), ("k_weight", k)])        # AM-1: a half-loaded Engram never runs
         # wkv_r == exact dequant of this rank's columns x 2^10 (sub-tables 2, 6, 10, 14, 18, 22)
         cols = np.concatenate([np.arange(sub * 256, sub * 256 + 256) for sub in svc.subtables])
         Wd = E4M3[torch.from_numpy(w[:, cols]).long()] * torch.pow(
@@ -220,20 +225,80 @@ def test_wkv_loader_exactness_and_refusals(syn: SyntheticEngram) -> None:
         svc.shutdown()
 
 
-def test_wait_refuses_cuda_graph_capture(syn: SyntheticEngram, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A FULL-mode capture of the Engram wait would replay zero rows forever: it must fail loudly instead."""
+def _fc(dummy: bool):
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    return override_forward_context(ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={},
+                                                   is_dummy_run=dummy))
+
+
+def test_dummy_forward_is_exact_zero_and_unbound_real_raises(syn: SyntheticEngram,
+                                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """AM-2: is_dummy_run -> stream unchanged bit for bit (no host I/O); a real forward without bound rows raises;
+    a FULL-mode style capture of the wait raises (it would replay zero rows forever)."""
     monkeypatch.setenv("VLLM_DS41_ENGRAM_IMPL", "sm70")
     mod, svc = make_module(syn, 1, 0, 1, synthetic_wkv(14), max_tokens=8)
     try:
-        svc.bind_batch(EngramBatchLayout(-1, (), np.zeros(1, np.int32), 0, 4, None))
-        stream = torch.zeros(4, 4, 5120, dtype=torch.bfloat16, device="cuda")
-        mod(stream, torch.arange(4, device="cuda"))          # eager dummy run is fine
+        stream = random_stream(8, 3).cuda()
+        before = stream.clone()
+        with _fc(True):
+            mod(stream, torch.arange(8, device="cuda"))
+        torch.cuda.synchronize()
+        assert torch.equal(stream, before) and svc.stats()["dummy_steps"] == 1 and svc.stats()["lookups"] == 0
+        for ctx in (_fc(False), contextlib.nullcontext()):
+            with ctx, pytest.raises(RuntimeError, match="REAL step"):
+                mod(stream, torch.arange(8, device="cuda"))
         g = torch.cuda.CUDAGraph()
-        with pytest.raises(RuntimeError, match="captured into a CUDA graph"):
+        with _fc(True), pytest.raises(RuntimeError, match="captured into a CUDA graph"):
             with torch.cuda.graph(g):
-                mod(stream, torch.arange(4, device="cuda"))
+                mod(stream, torch.arange(8, device="cuda"))
     finally:
         svc.shutdown()
+
+
+def test_breakable_capture_dummy_then_replay_real(syn: SyntheticEngram, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Capture under 1Cat's breakable CUDA graph with a dummy forward context, replay on a real bound step:
+    identical to the eager forward (the wait is an eager segment; decode/GEMM/gate are graph segments)."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.models.deepseek_v41.common import engram as E
+
+    monkeypatch.setenv("VLLM_DS41_ENGRAM_IMPL", "sm70")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    E._eager_wait.cache_clear()
+    try:
+        mod, svc = make_module(syn, 14, 0, 1, synthetic_wkv(15), max_tokens=16)
+        try:
+            T, t_pad = 6, 8
+            ids = np.random.default_rng(4).integers(3, 129000, size=T).astype(np.int32)
+            real = random_stream(t_pad, 5).cuda()
+            real[T:] = 0
+            static = torch.zeros_like(real)
+            pos = torch.arange(t_pad, device="cuda")
+            cs = torch.cuda.Stream()
+            with torch.cuda.stream(cs):
+                with _fc(True):
+                    mod(static, pos)                               # warm-up (Triton compile) outside capture
+                    cap = BreakableCUDAGraphCapture()
+                    with cap:
+                        mod(static, pos)
+            assert cap.num_eager_breaks == 1 and cap.num_graphs == 2
+            bind(svc, 0, ids, t_pad)
+            static.copy_(real)
+            torch.cuda.synchronize()
+            with torch.cuda.stream(cs), _fc(False):
+                cap.replay()
+            torch.cuda.synchronize()
+            bind(svc, 1, ids, t_pad)
+            eager = real.clone()
+            with _fc(False):
+                mod(eager, pos)
+            torch.cuda.synchronize()
+            assert not torch.equal(eager[:T], real[:T]), "Engram contributed nothing"
+            assert torch.equal(static, eager), "graph replay differs from the eager forward"
+        finally:
+            svc.shutdown()
+    finally:
+        E._eager_wait.cache_clear()
 
 
 # ------------------------------------------------------------------------------ real weights (shards 47/48)
@@ -305,8 +370,7 @@ def test_module_real_weights_vs_reference(monkeypatch: pytest.MonkeyPatch, layer
         try:
             with torch.device("cuda"):
                 mod = DeepseekV41Engram(None, f"model.layers.{layer}.engram", layer, svc)
-            for name, t in (("wkv.weight", w), ("wkv.scale", s), ("q_weight", q), ("k_weight", k)):
-                mod.load_checkpoint_tensor(name, t)
+            mod.load_weights([("wkv.weight", w), ("wkv.scale", s), ("q_weight", q), ("k_weight", k)])
             bind(svc, 0, ids, len(ids))
             got_rows = svc.wait_rows(layer).cpu().numpy()
             np.testing.assert_array_equal(got_rows, rows[:, list(svc.subtables)])
@@ -378,8 +442,8 @@ def test_engram_vs_golden(case: Path | None, monkeypatch: pytest.MonkeyPatch) ->
             with torch.device("cuda"):
                 mod = DeepseekV41Engram(None, f"model.layers.{layer}.engram", layer, svc)
             with safe_open(str(path), framework="pt") as fh:
-                for name in ("wkv.weight", "wkv.scale", "q_weight", "k_weight"):
-                    mod.load_checkpoint_tensor(name, fh.get_tensor(f"layers.{layer}.engram.{name}"))
+                mod.load_weights([(name, fh.get_tensor(f"layers.{layer}.engram.{name}"))
+                                  for name in ("wkv.weight", "wkv.scale", "q_weight", "k_weight")])
             ids32 = hist.astype(np.int32)
             svc.begin_step(EngramStepPlan(0, (EngramReqStep("g", start, n, ids32[start:], ids32),), frozenset()))
             svc.bind_batch(EngramBatchLayout(0, ("g",), np.array([0, n], np.int32), n, n, None))

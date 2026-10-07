@@ -172,17 +172,25 @@ def test_async_fill_rollback_resume_finish(syn: SyntheticEngram) -> None:
         svc.shutdown()
 
 
-def test_dummy_bind_and_missing_bind(syn: SyntheticEngram) -> None:
+def test_dummy_rows_and_unbound_real_step(syn: SyntheticEngram) -> None:
+    """AM-2: dummy forwards get zero rows in the static buffer (no host I/O, counted); a real step without bound rows
+    raises; bind_batch refuses dummy layouts; a bind for a step begin_step never saw raises."""
     svc = make_service(syn, tp_rank=0)
     try:
-        svc.bind_batch(EngramBatchLayout(-1, (), np.zeros(1, np.int32), 0, 8, None))
         buf = svc.rows_buffer(1, 8)
         buf.fill_(7)
-        assert not svc.wait_rows(1).any() and svc.wait_rows(1).data_ptr() == buf.data_ptr()
+        rows = svc.dummy_rows(1, 8)
+        assert rows.data_ptr() == buf.data_ptr() and not rows.any()
+        svc.dummy_rows(14, 8)
+        assert svc.stats()["dummy_steps"] == 1 and svc.stats()["lookups"] == 0
+        with pytest.raises(RuntimeError, match="REAL step"):
+            svc.wait_rows(1)
+        with pytest.raises(ValueError, match="is_dummy_run"):
+            svc.bind_batch(EngramBatchLayout(-1, (), np.zeros(1, np.int32), 0, 8, None))
         p = np.arange(100, 120, dtype=np.int32)
         svc.begin_step(EngramStepPlan(0, (EngramReqStep("Z", 0, 20, p, p),), frozenset()))
-        with pytest.raises(RuntimeError, match="bind_batch"):
-            svc.wait_rows(1)                     # begin_step cleared the dummy binding: no silent zero rows
+        with pytest.raises(RuntimeError, match="REAL step"):
+            svc.wait_rows(1)                      # begun but not bound
         with pytest.raises(RuntimeError, match="begin_step saw"):
             svc.bind_batch(EngramBatchLayout(5, ("Z",), np.array([0, 20], np.int32), 20, 20, None))
     finally:

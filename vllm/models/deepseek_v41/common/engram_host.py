@@ -19,6 +19,7 @@ Per step (hooks called by L-CORE, §3.6):
                      H2D copy on the service's copy stream. Never waits for I/O.
   wait_rows(layer)   inside the module's eager break: finishes the gather and the H2D if still pending, makes the
                      current stream wait for it, expands unique rows -> the static dense buffer [T_pad, n_sub, 264].
+  dummy_rows(...)    AM-2: profiling / CUDA-graph-capture forwards (ForwardContext.is_dummy_run) get zero rows.
 Two pinned/device slots alternate so step k+1's gather and copy overlap step k's compute; the copy into a device
 slot waits for the event recorded after that slot's previous expansion.
 """
@@ -341,8 +342,7 @@ class EngramHostService:
 
         self._hist: dict[str, _History] = {}
         self._step: _Step | None = None
-        self._dummy_t_pad: int | None = None
-        self._stats = dict(steps=0, lookups=0, unique_rows=0, hits=0, misses=0, pages=0, prefetch_rows=0,
+        self._stats = dict(steps=0, dummy_steps=0, lookups=0, unique_rows=0, hits=0, misses=0, pages=0, prefetch_rows=0,
                            wait_blocked_s=0.0, h2d_bytes=0)
         self._lat_ms: list[float] = []
         self.init_seconds = time.perf_counter() - t0
@@ -420,7 +420,6 @@ class EngramHostService:
         gather; admission prefetch for new/resumed requests. Never blocks on I/O (a CPU wait happens only if the H2D
         that last read this pinned slot -- two steps ago -- has not finished)."""
         self._retire_step()
-        self._dummy_t_pad = None
         for rid in plan.finished_req_ids:
             self._hist.pop(rid, None)
         slot = self._next_slot
@@ -484,15 +483,15 @@ class EngramHostService:
         self._stats["steps"] += 1
 
     def bind_batch(self, layout: EngramBatchLayout) -> None:
-        """Runner thread, after _prepare_inputs and before the forward. A layout with step_id < 0 or no tokens
-        (profile / CUDA-graph capture / dummy runs) binds all-zero rows for its T_pad padding tokens."""
+        """Runner thread, after _prepare_inputs and before the forward of a REAL scheduled step. Dummy forwards
+        (profiling, CUDA-graph capture) are not bound: the module asks for ``dummy_rows`` when the forward context
+        says ``is_dummy_run`` (AM-2)."""
         t_pad = int(layout.num_tokens_padded)
         if t_pad > self.max_tokens:
             raise ValueError(f"Engram: T_pad {t_pad} > max_num_batched_tokens {self.max_tokens}")
-        if layout.step_id < 0 or layout.num_tokens == 0:
-            self._dummy_t_pad = t_pad
-            return
-        self._dummy_t_pad = None
+        if layout.step_id < 0 or layout.num_tokens <= 0:
+            raise ValueError(f"Engram: bind_batch got step {layout.step_id} with {layout.num_tokens} tokens; dummy "
+                             "forwards are marked by ForwardContext.is_dummy_run and are never bound (AM-2)")
         step = self._step
         if step is None or step.step_id != layout.step_id:
             raise RuntimeError(f"Engram: bind_batch for step {layout.step_id} but begin_step saw "
@@ -575,14 +574,11 @@ class EngramHostService:
         """Inside the Engram eager break: block the CPU until this step's rows are gathered and their H2D is enqueued,
         make the current stream wait for it, expand to the static device view [T_pad, n_sub, 264] u8 of layer_id."""
         li = self.layers.index(layer_id)
-        if self._dummy_t_pad is not None:
-            out = self._dense[li, : self._dummy_t_pad]
-            out.zero_()
-            return out
         step = self._step
         if step is None or step.layout is None:
-            raise RuntimeError("Engram wait_rows: no batch bound -- the runner must call bind_batch(layout) before "
-                               "every forward (step_id=-1 for profile/capture/dummy runs)")
+            raise RuntimeError("Engram wait_rows: a REAL step reached Engram without bound rows -- the worker must call "
+                               "begin_step(plan) and the runner bind_batch(layout) before every non-dummy forward "
+                               "(dummy forwards must set ForwardContext.is_dummy_run, AM-2)")
         if not step.h2d_issued:
             self._issue_h2d(step)
         if not step.expanded:
@@ -597,6 +593,15 @@ class EngramHostService:
             self._consumed_recorded[step.slot] = True
             step.expanded = True
         return self._dense[li, : step.t_pad]
+
+    def dummy_rows(self, layer_id: int, num_tokens_padded: int) -> torch.Tensor:
+        """AM-2 dummy forward (profiling / CUDA-graph capture): all-zero rows in the static buffer -> the Engram
+        contribution is exactly zero; no host I/O, no step state touched. Counted once per forward."""
+        out = self.rows_buffer(layer_id, num_tokens_padded)
+        out.zero_()
+        if layer_id == self.layers[0]:
+            self._stats["dummy_steps"] += 1
+        return out
 
     def end_step(self, step_id: int) -> None:
         step = self._step

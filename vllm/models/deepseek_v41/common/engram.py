@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -372,16 +373,30 @@ def post_wkv_gate_torch_(stream: torch.Tensor, kv: torch.Tensor, qk: torch.Tenso
 
 
 # ------------------------------------------------------------------------------------------------ module
+def _forward_is_dummy() -> bool:
+    """AM-2: memory-profiling / CUDA-graph-capture forwards are marked by the runner (ForwardContext.is_dummy_run)."""
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    return is_forward_context_available() and bool(get_forward_context().is_dummy_run)
+
+
 def _wait_rows_eager(service: EngramHostService, layer_id: int, out: torch.Tensor) -> None:
     """The Engram eager break (PORT_DESIGN §1 CUDA-graph row): CPU wait for this step's rows + stream wait, written
     into the service's static device buffer ``out`` (the same address on every replay).
 
-    It must never be captured: in FULL cudagraph mode ``eager_break_during_capture`` runs the function inline, and a
-    captured wait would replay the capture-time rows (zeros) on every step -- silently disabling Engram."""
+    Dummy forwards (AM-2: profiling, CUDA-graph capture) get all-zero rows -- an exact zero contribution, no host I/O --
+    while the module still launches its kernels, so a captured graph contains them and every replay re-runs this
+    function with the real step's rows. A real step without bound rows raises inside ``service.wait_rows``.
+
+    It must never be captured itself: in FULL cudagraph mode ``eager_break_during_capture`` runs the function inline,
+    and a captured wait would replay the capture-time (zero) rows on every step -- silently disabling Engram."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(f"Engram layer {layer_id}: the row wait is being captured into a CUDA graph. It must run as "
                            "an eager break (breakable cudagraph); FULL cudagraph mode cannot serve Engram rows.")
-    rows = service.wait_rows(layer_id)
+    if _forward_is_dummy():
+        rows = service.dummy_rows(layer_id, out.shape[0])
+    else:
+        rows = service.wait_rows(layer_id)
     if rows.data_ptr() != out.data_ptr() or rows.shape != out.shape:
         raise RuntimeError(f"Engram layer {layer_id}: service returned rows {tuple(rows.shape)} at "
                            f"{rows.data_ptr():#x}, the captured buffer is {tuple(out.shape)} at {out.data_ptr():#x}")
@@ -423,7 +438,23 @@ class DeepseekV41Engram(nn.Module):
         self._pending: dict[str, torch.Tensor] = {}
         self._consumed: set[str] = set()
 
-    # ---- loading (PORT_DESIGN §3.7): L-CORE routes f"layers.{L}.engram.<name>" here ----
+    # ---- loading (PORT_DESIGN §3.7 + AM-1) ----
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """AM-1: every non-embed ``layers.{L}.engram.*`` checkpoint tensor, module-relative names ('wkv.weight',
+        'wkv.scale', 'q_weight', 'k_weight'). Returns the consumed names plus the parameters they completed
+        ('wkv_r', 'qk'), so both L-CORE's consumed-name check and vLLM's every-parameter-loaded check see them.
+        Raises if a source tensor is missing: a half-loaded Engram must never run."""
+        done: set[str] = set()
+        for name, tensor in weights:
+            param = self.load_checkpoint_tensor(name, tensor)
+            done.add(name)
+            if param is not None:
+                done.add(param)
+        if not self.weights_loaded():
+            missing = sorted({"wkv.weight", "wkv.scale", "q_weight", "k_weight"} - self._consumed)
+            raise ValueError(f"{self.prefix}: Engram checkpoint tensors {missing} were not provided")
+        return done
+
     def load_checkpoint_tensor(self, name: str, tensor: torch.Tensor) -> str | None:
         """Consume one checkpoint tensor (``name`` = suffix after ``layers.{L}.engram.``).
 
