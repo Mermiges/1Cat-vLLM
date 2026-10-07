@@ -346,7 +346,7 @@ class RefState:
 
 def ref_attention(cfg: SimpleNamespace, topo: LayerTopology, w: dict[str, torch.Tensor], x16: torch.Tensor,
                   st: RefState, record: dict | None = None, q_rows: torch.Tensor | None = None,
-                  score_rows: int = 256) -> torch.Tensor:
+                  score_rows: int = 256, ckv_records: torch.Tensor | None = None) -> torch.Tensor:
     """One layer of the reference over a whole sequence (start_pos 0), FP32 math, QAT kept. Returns out [S, 5120]
     FP32 (wo_b output). ``record`` receives intermediates (golden names of §3.8)."""
     rec = record if record is not None else {}
@@ -376,6 +376,10 @@ def ref_attention(cfg: SimpleNamespace, topo: LayerTopology, w: dict[str, torch.
             k = _rms(latent @ w["attn.indexer.wk.weight"].t(), w["attn.indexer.k_norm.weight"])
             st.ik[topo.layer_id] = qat.fp4_e8m0_qdq(_rot(k, fpos), out_dtype=torch.float32, impl="torch")
             st.ckv[topo.layer_id] = qat.fp4_e4m3_qdq(_rot(latent, fpos), out_dtype=torch.float32, impl="torch")
+            if ckv_records is not None:          # substitution experiments: another path's compressed records
+                if ckv_records.shape != st.ckv[topo.layer_id].shape:
+                    raise ValueError(f"ckv_records {tuple(ckv_records.shape)} != {tuple(st.ckv[topo.layer_id].shape)}")
+                st.ckv[topo.layer_id] = ckv_records.float()
             rec.update({"attn.latent": latent, "attn.ckv": st.ckv[topo.layer_id], "idx.k": st.ik[topo.layer_id]})
         if topo.owns_indexer:
             iq = qat.fp4_e8m0_qdq(_rot((qr @ w["attn.indexer.wq_b.weight"].t()).view(S, 32, 128), fc),
