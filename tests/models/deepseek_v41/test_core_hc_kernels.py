@@ -209,6 +209,7 @@ def _fake_model(pp_is_last: bool, fused: bool):
     layers = [_fake_layer(i, 10 * i, engram=(i == 1)) for i in range(4)]
     fake = SimpleNamespace(pp_is_first=False, pp_is_last=pp_is_last, layers=layers, start_layer=0, end_layer=4,
                            hc_fused=fused, mirror=None, kv20_crc_check=False,
+                           dspark_aux_layers=(),
                            stage=SimpleNamespace(exports_kv_sources=(), mirrored_kv_sources=()),
                            norm=_Norm(_params(999)[3]))
     return functools.partial(DeepseekV41Model.forward, fake)
