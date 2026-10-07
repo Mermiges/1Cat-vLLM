@@ -299,3 +299,15 @@ def test_scale_range_and_row_bias(tmp_path: Path) -> None:
         assert svc.row_bias(1) == 5 and svc.scale_exponent_range[1] == (-20, -12)
     finally:
         svc.shutdown()
+
+
+def test_io_threads_knob_overrides_ctor(syn: SyntheticEngram, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_DS41_ENGRAM_IO_THREADS", "1")
+    svc = make_service(syn, io_threads=4)
+    try:
+        assert svc.io_threads == 1 and svc._reader.num_threads() == 1
+    finally:
+        svc.shutdown()
+    monkeypatch.setenv("VLLM_DS41_ENGRAM_IO_THREADS", "0")
+    with pytest.raises(ValueError, match="minimum"):
+        make_service(syn)

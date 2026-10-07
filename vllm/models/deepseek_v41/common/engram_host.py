@@ -64,6 +64,7 @@ O_DIRECT_KNOB = "VLLM_DS41_ENGRAM_O_DIRECT"                # bypass the page cac
 PREFETCH_KNOB = "VLLM_DS41_ENGRAM_PREFETCH"                # admission prefetch of whole prompts
 REQUIRE_VERIFIED_KNOB = "VLLM_DS41_ENGRAM_REQUIRE_VERIFIED"  # shard needs its <file>.sha256-ok sidecar
 BUILD_DIR_KNOB = "VLLM_DS41_ENGRAM_BUILD_DIR"              # torch extension build directory
+IO_THREADS_KNOB = "VLLM_DS41_ENGRAM_IO_THREADS"            # overrides the ctor's io_threads (CPU budget per rank)
 N_SLOTS = 2
 _LATENCY_WINDOW = 4096
 
@@ -318,6 +319,7 @@ class EngramHostService:
             buf.register()
             self._scales.append(buf)
 
+        io_threads = knobs.env_int(IO_THREADS_KNOB, int(io_threads), minimum=1, maximum=64)
         ext = load_engram_rows_extension()
         paths = [loc.weight_path for loc in self.tables]
         uniq_paths = sorted(set(paths))
