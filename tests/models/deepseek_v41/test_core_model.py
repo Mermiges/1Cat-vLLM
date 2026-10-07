@@ -306,3 +306,24 @@ def test_ubatching_refused(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -
     vc.parallel_config.enable_dbo = True
     with set_current_vllm_config(vc), pytest.raises(NotImplementedError, match="micro-batching"):
         DeepseekV41Model(vllm_config=vc, prefix="model")
+
+
+@pytest.mark.parametrize("withheld, expect", [
+    ({"head.weight"}, "lm_head.weight"),
+    ({"norm.weight"}, "model.norm.weight"),
+    ({"layers.3.attn.wq_b.scale"}, "model.layers.3.attn.wq_b.weight_scale_inv"),
+    ({"layers.1.engram.q_weight", "layers.1.engram.k_weight", "layers.1.engram.wkv.weight",
+      "layers.1.engram.wkv.scale"}, "no checkpoint tensors reached"),
+])
+def test_incomplete_checkpoint_raises(ds41_dist_single, ds41_checkpoint_dir, monkeypatch, withheld, expect) -> None:
+    """MC-CORE F1: every parameter needing checkpoint data must be filled (vLLM skips its check when quantized)."""
+    model, _ = _build(ds41_checkpoint_dir, monkeypatch)
+    weights = ((n, t) for n, t in _weights_for({0, 1, 2, 3}) if n not in withheld)
+    with pytest.raises(RuntimeError, match=expect.replace(".", r"\.")):
+        model.load_weights(weights)
+
+
+def test_derived_params_exempt(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
+    model, _ = _build(ds41_checkpoint_dir, monkeypatch)
+    model.model.norm.ds41_no_checkpoint_params = ("weight",)
+    model.load_weights((n, t) for n, t in _weights_for({0, 1, 2, 3}) if n != "norm.weight")

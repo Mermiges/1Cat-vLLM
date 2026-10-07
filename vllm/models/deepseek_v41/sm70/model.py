@@ -499,6 +499,10 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                     tensor = tensor.narrow(0, heads * tp_rank, heads)
                 (loader or default_weight_loader)(param, tensor)
                 loaded.add(name)
+        starved = sorted(set(self._delegates) - set(delegated))
+        if starved:
+            raise RuntimeError(f"no checkpoint tensors reached {starved} (Engram q/k/wkv live in shards 47/48: are "
+                               "they present and verified in the model directory?)")
         for prefix, items in delegated.items():
             # PORT_DESIGN §9 AM-1: the module returns the module-relative checkpoint names it consumed
             module = self._delegates[prefix]
@@ -508,7 +512,24 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
                 raise RuntimeError(f"{prefix}.load_weights consumed {sorted(consumed)} of {sorted(given)}; "
                                    f"unconsumed {sorted(given - consumed)}, unknown {sorted(consumed - given)}")
             loaded.update(f"{prefix}.{name}" for name, _ in module.named_parameters())
+        self._check_complete(loaded)
         return loaded
+
+    def _check_complete(self, loaded: set[str]) -> None:
+        """Every parameter that needs checkpoint data must have been filled. vLLM's own completeness check is off
+        whenever a quantization method is set (always, for this model), so a missing shard would otherwise leave
+        torch.empty garbage / initial values and the server would come up (rule 9). Exempt: zero-size parameters and
+        names a module lists in ``ds41_no_checkpoint_params`` (module-relative; parameters it derives itself)."""
+        derived: set[str] = set()
+        for mod_name, module in self.named_modules():
+            for rel in getattr(module, "ds41_no_checkpoint_params", ()):
+                derived.add(f"{mod_name}.{rel}" if mod_name else rel)
+        missing = sorted(name for name, param in self.named_parameters()
+                         if name not in loaded and name not in derived and param.numel() > 0)
+        if missing:
+            shown = ", ".join(missing[:20]) + (f", ... ({len(missing)} total)" if len(missing) > 20 else "")
+            raise RuntimeError(f"DeepSeek-V4.1 checkpoint did not provide {len(missing)} parameter(s) of this stage: "
+                               f"{shown}. Check that all 48 shards are present and verified in the model directory.")
 
     @staticmethod
     def _load_expert(params: dict[str, nn.Parameter], name: str, tensor: torch.Tensor,
