@@ -45,6 +45,7 @@ from vllm.models.deepseek_v41.common.contracts import (
     SharedAttnBuffers,
 )
 from vllm.models.deepseek_v41.compressor import FP32RMSNorm, mm_fp32, mm_fp32_full
+from vllm.models.deepseek_v41.sm70 import decode_kernels as dk
 from vllm.models.deepseek_v41.sm70.indexer_kernels import (
     index_k_rope_qat_store,
     index_q_rope_qat,
@@ -98,6 +99,9 @@ class DeepseekV41Indexer(nn.Module):
                 vllm_config.cache_config.block_size, self.ratio), DS41CompressedBackend, vllm_config)
         # shared with (and attached by) the attention layer; kept out of the module tree on purpose
         self.__dict__["rotary_emb"] = None
+        self._decode_fp32: dict[str, tuple[tuple[int, int], torch.Tensor]] = {}
+        max_len = int(vllm_config.model_config.max_model_len)
+        self.decode_width = max(IDX_TOPK, (max_len + self.ratio - 1) // self.ratio)
         self.score_budget = knobs.env_int(SCORE_BUDGET_ENV, 128, minimum=8) << 20
         self._static_ctx = vllm_config.compilation_config.static_forward_context
 
@@ -142,6 +146,14 @@ class DeepseekV41Indexer(nn.Module):
             raise RuntimeError(f"{self.prefix}: {n} latents but metadata expects {md.num_latents}")
         # [N, 512] x [512, 128] in FP32 (negligible cost): no FP16 rounding of the latent before the FP4 QAT,
         # which otherwise flips ~0.7 % of index-K records vs the v100-semantic reference
+        if md.decode:
+            # Cache FP32 operands after loading, before capture. Versions guard reloads.
+            wk32 = self._fp32_weight(self.wk, "_decode_wk")
+            k = torch.mm(latent, wk32.t())
+            export = self.shared.export_ik if self.layer_id == CAND_SOURCE else None
+            dk.index_k_norm_store(k, self.k_norm.weight, self.k_norm.eps, latent_pos, self._rope(),
+                                  self._key_rows(), md.latent_slots, export)
+            return
         k = self.k_norm(torch.mm(latent.float(), wk.float().t()))
         export = None
         if self.layer_id == CAND_SOURCE and self.shared.export_ik is not None:
@@ -157,6 +169,9 @@ class DeepseekV41Indexer(nn.Module):
         md = self._metadata()
         if md is None:
             mm_fp32(x, self._w(self.weights_proj, (IDX_HEADS, HIDDEN)))
+            return
+        if md.decode:
+            self._decode_forward(x, qr, md)
             return
         T = md.num_actual_tokens
         topk_out = self.shared.topk_indices[:T]
@@ -220,3 +235,64 @@ class DeepseekV41Indexer(nn.Module):
                     cols = torch.arange(n, device=x.device)
                     scores.masked_fill_(cols[None, :] >= e[:, None], float("-inf"))
                 topk_out[a:b] = topk_sorted(scores, e, IDX_TOPK)
+
+    def _fp32_weight(self, lin: nn.Module, name: str) -> torch.Tensor:
+        w = lin.weight
+        if w.dtype != torch.float16:
+            raise TypeError(
+                f"{self.prefix}: decode indexer needs FP16 weights, got {w.dtype}"
+            )
+        cached = self._decode_fp32.get(name)
+        identity = (w.data_ptr(), w._version)
+        if cached is None or cached[0] != identity:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{self.prefix}: warm decode weights before CUDA graph capture"
+                )
+            cached = (identity, w.float())
+            self._decode_fp32[name] = cached
+        return cached[1]
+
+    def _decode_forward(
+        self, x: torch.Tensor, qr: torch.Tensor, md: DS41CompressedMetadata
+    ) -> None:
+        T = x.shape[0]
+        q = torch.mm(qr, self._fp32_weight(self.wq_b, "_decode_wqb").t())
+        q = index_q_rope_qat(
+            q.view(T, IDX_HEADS, IDX_DIM), md.positions, self._rope(), impl="sm70"
+        )
+        w = mm_fp32(x, self._w(self.weights_proj, (IDX_HEADS, HIDDEN)))
+        # Match the general path's FP32 multiplication before the head reduction.
+        w = w * (self.softmax_scale * IDX_HEADS**-0.5)
+        cand = self.shared.candidate_blocks[:T] if self.topo.uses_candidates else None
+        width = CAND_TOPK_BLOCKS * CAND_BLOCK if cand is not None else self.decode_width
+        scores = dk.index_scores_decode(
+            q,
+            w,
+            1.0,
+            self._key_rows(),
+            md.block_table,
+            md.token_to_req_indices,
+            md.storage_block_size,
+            md.num_visible,
+            width,
+            cand=cand,
+        )
+        if self.topo.is_candidate_source:
+            select_candidate_blocks(
+                scores,
+                md.num_visible,
+                CAND_TOPK_BLOCKS,
+                CAND_BLOCK,
+                out=self.shared.candidate_blocks[:T],
+            )
+        lengths = md.num_visible
+        if cand is not None:
+            lengths = torch.where(
+                (cand[:, 0] == CAND_ALL) | (lengths == 0),
+                lengths,
+                torch.full_like(lengths, width)
+            )
+        dk.topk_decode(
+            scores, lengths, IDX_TOPK, self.shared.topk_indices[:T], cand=cand
+        )

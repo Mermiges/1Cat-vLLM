@@ -25,6 +25,7 @@ names, so consumer code is identical on every stage.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import cast
 
 import torch
@@ -65,9 +66,11 @@ from vllm.models.deepseek_v41.compressor import (
 )
 from vllm.models.deepseek_v41.indexer import DeepseekV41Indexer, attn_impl
 from vllm.models.deepseek_v41.quant_config import v41_grouped_linear, v41_linear
+from vllm.models.deepseek_v41.sm70 import decode_kernels as dk
 from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 from vllm.models.deepseek_v41.sm70.sparse import (
     DeepseekV41SM70SparseImpl,
+    DS41BatchMetadata,
     DS41CacheLayer,
     DS41CompressedBackend,
     DS41CompressedMetadata,
@@ -194,6 +197,9 @@ class DeepseekV41Attention(nn.Module):
             self._profile_run(x, positions, out)
             return
         swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
+        if swa_md.decode:
+            self._decode_attention(x, out, swa_md, md_all)
+            return
         T = swa_md.num_actual_tokens
         impl = attn_impl()
         pos = positions[:T]
@@ -219,6 +225,7 @@ class DeepseekV41Attention(nn.Module):
                                    src_md.latent_slots, export, impl=impl)
             if self.indexer is not None:
                 self.indexer.forward(x[:T], qr32, pos)
+            assert self.kv_source_name is not None
             src_md = cast(DS41CompressedMetadata, md_all[self.kv_source_name])
             src = self._static_ctx.get(self.kv_source_name)
             if src is None:
@@ -229,6 +236,85 @@ class DeepseekV41Attention(nn.Module):
                                           self.scale, out[:T], impl=impl)
         if out.shape[0] > T:
             out[T:].zero_()
+
+    def _decode_attention(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        swa_md: DS41SWAMetadata,
+        md_all: Mapping[str, DS41BatchMetadata],
+    ) -> None:
+        """Uniform decode: T_pad shapes, device-side live positions and slots."""
+        T = x.shape[0]
+        pos = swa_md.positions
+        qr_kv = v41_linear(self.fused_wqa_wkv, x, torch.float32)
+        qr32, qr, kv = dk.qkv_norm(
+            qr_kv, self.q_norm.weight, self.kv_norm.weight, self.eps, Q_LORA
+        )
+        q = v41_linear(self.wq_b, qr, torch.float16).view(
+            T, self.n_local_heads, HEAD_DIM
+        )
+        q_rope_kv_insert(
+            q,
+            kv,
+            pos,
+            self.rotary_emb.cos_sin_cache,
+            self.swa_cache.rows(),
+            swa_md.slot_mapping,
+            impl="sm70",
+        )
+        ckv_rows = topk = bt = tok2req = None
+        storage = 0
+        if self.topo.compress_ratio > 0:
+            if self.compressor is not None:
+                latent, latent_pos = self.compressor(x, pos)
+                assert self.indexer is not None and self.kv_cache_layer is not None
+                self.indexer.write_keys(latent, latent_pos)
+                own_md = cast(
+                    DS41CompressedMetadata, md_all[self.kv_cache_layer.layer_name]
+                )
+                export = (
+                    self.shared.export_ckv if self.layer_id == CAND_SOURCE else None
+                )
+                ckv_rope_qat_store(
+                    latent,
+                    latent_pos,
+                    self.rotary_emb.cos_sin_cache,
+                    self.kv_cache_layer.rows(),
+                    own_md.latent_slots,
+                    export,
+                    impl="sm70",
+                )
+            if self.indexer is not None:
+                self.indexer.forward(x, qr32, pos)
+            assert self.kv_source_name is not None
+            src_md = cast(DS41CompressedMetadata, md_all[self.kv_source_name])
+            src = self._static_ctx.get(self.kv_source_name)
+            if src is None or not src_md.decode:
+                raise RuntimeError(
+                    f"decode KV source {self.kv_source_name} missing "
+                    "or metadata is not decode"
+                )
+            ckv_rows = cast(DS41CacheLayer, src).rows()
+            topk, bt, tok2req = (
+                self.shared.topk_indices[:T],
+                src_md.block_table,
+                src_md.token_to_req_indices,
+            )
+            storage = src_md.storage_block_size
+        dk.sparse_attention_decode(
+            q,
+            self.swa_cache.rows(),
+            swa_md.window_slots,
+            ckv_rows,
+            topk,
+            bt,
+            tok2req,
+            storage,
+            self.attn_sink,
+            self.scale,
+            out,
+        )
 
     def _profile_run(self, x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor) -> None:
         """Dummy/profile forward: run the projections at full size and reserve the attention workspace."""

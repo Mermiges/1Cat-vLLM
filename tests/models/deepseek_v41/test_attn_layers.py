@@ -80,11 +80,11 @@ class Stage:
 
     def __init__(self, cfg, layer_ids, weights, *, stage: StagePlan | None = None, mirror: bool = False,
                  max_model_len: int = 65536, max_tokens: int = 4096, num_blocks: int = 512, seed: int = 0,
-                 tp_rank: int = 0, tp_size: int = 1, layers_prefix: str = "model.layers"):
+                 tp_rank: int = 0, tp_size: int = 1, layers_prefix: str = "model.layers", max_seqs: int = 4):
         from vllm.models.deepseek_v41.attention import DeepseekV41Attention
         from vllm.models.deepseek_v41.kv_mirror import DeepseekV41KVSourceMirror
         self.cfg = cfg
-        self.vcfg = vllm_config(cfg, max_model_len=max_model_len, max_tokens=max_tokens)
+        self.vcfg = vllm_config(cfg, max_model_len=max_model_len, max_tokens=max_tokens, max_seqs=max_seqs)
         self.stage = stage or StagePlan(0, 1, 0, 39, (), (), ())
         self.shared = allocate_shared_attn_buffers(max_tokens, self.stage, DEV)
         self.layer_ids = list(layer_ids)
@@ -112,10 +112,12 @@ class Stage:
             if not isinstance(md_all, dict):          # profile / dummy run
                 return latent, lpos
             md = md_all[comp.attn_prefix]
-            req_of = md.token_to_req_indices.index_select(0, md.latent_token_idx).tolist()
+            keep = md.latent_slots >= 0 if md.decode else torch.ones_like(md.latent_slots, dtype=torch.bool)
+            recorded_latent, recorded_pos = latent[keep], lpos[keep]
+            req_of = md.token_to_req_indices.index_select(0, md.latent_token_idx[keep]).tolist()
             for k, ridx in enumerate(req_of):
                 req = self._batch[ridx][0]
-                self.rec.setdefault(("latent", layer_id, req), {})[int(lpos[k])] = latent[k].clone()
+                self.rec.setdefault(("latent", layer_id, req), {})[int(recorded_pos[k])] = recorded_latent[k].clone()
             return latent, lpos
         return wrapped
 
