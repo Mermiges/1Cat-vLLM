@@ -269,7 +269,10 @@ class DeepseekV41Mxfp4MoEMethod(FusedMoEMethodBase):
         torch.accelerator.empty_cache()
 
     # ---- compute ----
-    def expert_slots(self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+    def expert_slots(
+        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor,
+        route_tables: mk.RouteTables | None = None,
+    ) -> torch.Tensor:
         """x [T, H] fp16, topk_ids [T, k] int32 -> y [T * k, H] fp16 (route order, TP-partial)."""
         num_tokens, top_k = topk_ids.shape
         if x.dtype != torch.float16 or x.ndim != 2 or x.shape[0] != num_tokens or not x.is_contiguous():
@@ -277,6 +280,10 @@ class DeepseekV41Mxfp4MoEMethod(FusedMoEMethodBase):
                             f"{tuple(x.shape)}")
         if top_k != int(self.moe.experts_per_token) or topk_ids.dtype != torch.int32:
             raise TypeError(f"expert_slots: topk_ids must be int32 [T, {self.moe.experts_per_token}]")
+        if route_tables is not None and (self.backend != "skinny" or num_tokens != 1):
+            raise ValueError(
+                "precomputed routing tables require skinny single-token decode"
+            )
         if self.backend == "turbomind":
             assert self._tm is not None, "process_weights_after_loading has not run"
             return self._tm.apply_slots(layer, x, topk_ids.contiguous())
@@ -286,15 +293,22 @@ class DeepseekV41Mxfp4MoEMethod(FusedMoEMethodBase):
         chunk = SKINNY_GRID_Y_LIMIT // top_k
         for start in range(0, num_tokens, chunk):
             end = min(num_tokens, start + chunk)
-            self._skinny_chunk(layer, x[start:end], topk_ids[start:end].contiguous(), y[start * top_k:end * top_k])
+            self._skinny_chunk(
+                layer, x[start:end], topk_ids[start:end].contiguous(),
+                y[start * top_k:end * top_k], route_tables,
+            )
         return y
 
-    def _skinny_chunk(self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor,
-                      y: torch.Tensor) -> None:
+    def _skinny_chunk(
+        self, layer: torch.nn.Module, x: torch.Tensor, topk_ids: torch.Tensor,
+        y: torch.Tensor, route_tables: mk.RouteTables | None = None,
+    ) -> None:
         num_tokens, top_k = topk_ids.shape
         inter = int(self.moe.intermediate_size_per_partition)
         spill = int(layer.ds41_n_spilled) > 0
-        perm, tables = mk.route_prep(topk_ids, layer.ds41_phys_map, int(layer.ds41_n_resident), spill)
+        perm, tables = (route_tables if route_tables is not None else mk.route_prep(
+            topk_ids, layer.ds41_phys_map, int(layer.ds41_n_resident), spill,
+        ))
         y13 = torch.empty((num_tokens * top_k, 2 * inter), dtype=torch.float16, device=x.device)
         parts = self._partitions(layer)
         for (w13, s13, _, _), (g13, _), (gids, goff) in zip(parts, layer.ds41_gscales, tables):

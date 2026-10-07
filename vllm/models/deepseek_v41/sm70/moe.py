@@ -16,9 +16,12 @@
 
 Decode (T <= 8) runs the gate and the shared expert through the GEMVs of ``sm70/gemv.py`` (SwiGLU fused into the
 gate-up GEMV, the combine fused into the down GEMV); larger T uses cuBLAS with FP32 outputs and the Triton combine.
+For T=1 with the skinny backend, one graph-safe Triton launch combines router GEMV,
+top-k, route tables and shared gate-up/SwiGLU; each module owns its decode scratch.
 
 Knobs (``knobs.py`` helpers): ``VLLM_DS41_MOE_IMPL`` = sm70 | torch (per-expert FP32-dequantised oracle, §7.1);
 ``VLLM_DS41_MOE_BACKEND`` = skinny | turbomind; ``VLLM_DS41_MOE_DECODE_GEMV`` (default 1);
+``VLLM_DS41_MOE_DECODE_FRONT`` (default 1, set 0 for the unfused T=1 comparison);
 ``VLLM_DS41_MOE_TOPK_CHECK`` (default 0: all-gathers a router-id checksum across TP each step and asserts
 equality, §4.1; debug only — it syncs the host, so it refuses to run under CUDA-graph capture: use enforce_eager).
 """
@@ -47,6 +50,7 @@ from vllm.models.deepseek_v41.common import contracts as C
 
 from . import gemv as v41_gemv
 from . import moe_kernels as mk
+from .moe_decode import DecodeScratch, decode_front
 from .moe_method import DeepseekV41Mxfp4MoEMethod, ExpertSpillPlan, make_spill_plan
 
 __all__ = ["DeepseekV41MoE", "ExpertSpillPlan", "make_spill_plan", "make_v41_moe_method", "expert_spill_context"]
@@ -55,6 +59,7 @@ IMPL_KNOB = "VLLM_DS41_MOE_IMPL"
 BACKEND_KNOB = "VLLM_DS41_MOE_BACKEND"
 DECODE_GEMV_KNOB = "VLLM_DS41_MOE_DECODE_GEMV"
 TOPK_CHECK_KNOB = "VLLM_DS41_MOE_TOPK_CHECK"
+DECODE_FRONT_KNOB = "VLLM_DS41_MOE_DECODE_FRONT"
 _GATE_TARGET_MAX = 32768.0  # largest |W| * 2^e kept in FP16 (half the FP16 range, leaves headroom)
 
 _SPILL: contextvars.ContextVar[ExpertSpillPlan | None] = contextvars.ContextVar("ds41_moe_spill", default=None)
@@ -159,10 +164,15 @@ class DeepseekV41MoE(nn.Module):
             raise ValueError(f"DeepseekV41MoE: unsupported experts/top-k {self.n_experts}/{self.top_k}")
         self.impl = _impl()
         self.decode_gemv = knobs.env_bool(DECODE_GEMV_KNOB, True)
+        # Board-B (180 W) T=1 A/B: 8 -> 5 launches, 107.22 -> 97.32 us graph replay.
+        self.decode_front = knobs.env_bool(DECODE_FRONT_KNOB, True)
         self.topk_check = knobs.env_bool(TOPK_CHECK_KNOB, False)
         self.tp_size = get_tensor_model_parallel_world_size()
         quant_config = vllm_config.quant_config
         self.gate = DeepseekV41Gate(self.n_experts, self.hidden)
+        scratch = DecodeScratch.allocate(self.n_experts, self.gate.weight.device)
+        self.register_buffer("_decode_logits", scratch.logits, persistent=False)
+        self.register_buffer("_decode_counter", scratch.counter, persistent=False)
         with expert_spill_context(spill):
             self.experts = FusedMoE(
                 num_experts=self.n_experts, top_k=self.top_k, hidden_size=self.hidden,
@@ -186,6 +196,10 @@ class DeepseekV41MoE(nn.Module):
     @property
     def method(self) -> DeepseekV41Mxfp4MoEMethod:
         return self.experts.quant_method  # type: ignore[return-value]
+
+    @property
+    def _decode_scratch(self) -> DecodeScratch:
+        return DecodeScratch(self._decode_logits, self._decode_counter)
 
     # ---- router ----
     def gate_logits(self, x: torch.Tensor) -> torch.Tensor:
@@ -233,11 +247,29 @@ class DeepseekV41MoE(nn.Module):
         x = x.contiguous()
         if x.shape[0] == 0:
             return x.new_empty((0, self.hidden), dtype=torch.float32)
-        topk_w, topk_ids = self.route(self.gate_logits(x))
+        tables = None
+        shared_act = None
+        if (self.decode_front and self.impl == "sm70" and self.decode_gemv
+                and x.shape[0] == 1 and self.method.backend == "skinny"):
+            w13, _ = self.shared_experts.fp16_weights()
+            topk_w, topk_ids, tables, shared_act = decode_front(
+                x, self.gate.weight, self.gate.e_score_correction_bias, w13,
+                self._decode_scratch, top_k=self.top_k,
+                alpha=2.0 ** -self.gate.weight_exp, scale=self.routed_scale,
+                limit=self.swiglu_limit, phys_map=self.experts.ds41_phys_map,
+                n_resident=int(self.experts.ds41_n_resident),
+                spill=int(self.experts.ds41_n_spilled) > 0,
+            )
+        else:
+            topk_w, topk_ids = self.route(self.gate_logits(x))
         if self.topk_check and self.tp_size > 1:
             self._check_topk_consistent(topk_ids)
-        y_slots = self.method.expert_slots(self.experts, x, topk_ids)
-        out = self.shared_and_combine(x, y_slots, topk_w)
+        y_slots = self.method.expert_slots(self.experts, x, topk_ids, tables)
+        if shared_act is not None:
+            _, w2 = self.shared_experts.fp16_weights()
+            out = v41_gemv.down_combine(shared_act, w2, y_slots, topk_w)
+        else:
+            out = self.shared_and_combine(x, y_slots, topk_w)
         if self.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out
