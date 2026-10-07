@@ -54,7 +54,7 @@ SKINNY_GRID_Y_LIMIT = 65535
 # split-K of the grouped skinny launches: W13 K = 5120 (320 16-code groups), W2 K = 576 at TP4 (36 groups);
 # chosen by the decode microbenchmark (L-MOE progress, sub-item 4). grouped_splitk falls back if K differs.
 W13_SPLITK = 16
-W2_SPLITK = 12
+W2_SPLITK = 6
 _PARAMS = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 

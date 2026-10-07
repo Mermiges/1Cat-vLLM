@@ -26,13 +26,46 @@ from vllm.triton_utils import tl, triton
 MAX_GEMV_ROWS = 8
 
 
-def _block_k(k: int) -> int:
-    block = 1024
-    while block > 16 and k % block:
-        block //= 2
-    if k % block:
+_TILE_ELEMS = 8192  # FP32 accumulator elements per program (128 threads x 64 registers)
+
+
+def _config(n: int, k: int, m_pad: int, weights_per_row: int = 1) -> tuple[int, int]:
+    """(BLOCK_N, BLOCK_K) from the SM70 decode sweep (L-MOE progress, sub-item 4; L2-busting weight rotation).
+    The accumulator ``[M_PAD, BLOCK_N, BLOCK_K]`` (x ``weights_per_row``) stays within ``_TILE_ELEMS``."""
+    if k >= 1024:
+        block_n = {1: 2 if n <= 512 else 4, 2: 1, 4: 2}.get(m_pad, 2 if n <= 512 else 4)
+        block_k = 1024
+    else:
+        block_n, block_k = 8, 1024
+    while block_k > 16 and (k % block_k or m_pad * block_n * block_k * weights_per_row > _TILE_ELEMS):
+        block_k //= 2
+    while block_n > 1 and m_pad * block_n * block_k * weights_per_row > _TILE_ELEMS:
+        block_n //= 2
+    if k % block_k:
         raise ValueError(f"GEMV needs K to be a multiple of 16, got K={k}")
-    return block
+    return block_n, block_k
+
+
+@triton.jit
+def _dot_rows(x_ptr, stride_xm, w_ptr, rows, row_mask, K, M, M_PAD: tl.constexpr, BLOCK_N: tl.constexpr,
+              BLOCK_K: tl.constexpr):
+    """[M_PAD, BLOCK_N] FP32 = x[:M] . W[rows]^T; partial products accumulate elementwise and are reduced once."""
+    ks = tl.arange(0, BLOCK_K)
+    if M_PAD == 1:
+        acc2 = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            w = tl.load(w_ptr + rows[:, None] * K + (k0 + ks)[None, :], mask=row_mask[:, None], other=0.0)
+            x = tl.load(x_ptr + k0 + ks)
+            acc2 += w.to(tl.float32) * x.to(tl.float32)[None, :]
+        return tl.sum(acc2, axis=1)[None, :]
+    else:
+        ms = tl.arange(0, M_PAD)
+        acc3 = tl.zeros((M_PAD, BLOCK_N, BLOCK_K), dtype=tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            w = tl.load(w_ptr + rows[:, None] * K + (k0 + ks)[None, :], mask=row_mask[:, None], other=0.0)
+            x = tl.load(x_ptr + ms[:, None] * stride_xm + (k0 + ks)[None, :], mask=(ms < M)[:, None], other=0.0)
+            acc3 += x.to(tl.float32)[:, None, :] * w.to(tl.float32)[None, :, :]
+        return tl.sum(acc3, axis=2)
 
 
 @triton.jit
@@ -51,24 +84,12 @@ def _gemv_kernel(
     BLOCK_K: tl.constexpr,
     OUT_FP16: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     row_mask = rows < N
     ms = tl.arange(0, M_PAD)
-    m_mask = ms < M
-    ks = tl.arange(0, BLOCK_K)
-    acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
-    for k0 in range(0, K, BLOCK_K):
-        w = tl.load(w_ptr + rows[:, None] * K + (k0 + ks)[None, :], mask=row_mask[:, None], other=0.0)
-        w = w.to(tl.float32)
-        for m in tl.static_range(M_PAD):
-            if m < M:
-                x = tl.load(x_ptr + m * stride_xm + k0 + ks).to(tl.float32)
-                part = tl.sum(w * x[None, :], axis=1)
-                acc = tl.where((ms == m)[:, None], acc + part[None, :], acc)
-    acc = acc * alpha
+    acc = _dot_rows(x_ptr, stride_xm, w_ptr, rows, row_mask, K, M, M_PAD, BLOCK_N, BLOCK_K) * alpha
     out_ptrs = out_ptr + ms[:, None] * stride_om + rows[None, :]
-    mask = m_mask[:, None] & row_mask[None, :]
+    mask = (ms < M)[:, None] & row_mask[None, :]
     if OUT_FP16:
         tl.store(out_ptrs, acc.to(tl.float16), mask=mask)
     else:
@@ -89,11 +110,11 @@ def gemv(
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     if m == 0:
         return out
-    block_n = 4 if n >= 1024 else 2
+    m_pad = _m_pad(m)
+    block_n, block_k = _config(n, k, m_pad)
     _gemv_kernel[(triton.cdiv(n, block_n),)](
         x, weight, out, m, n, k, float(alpha), x.stride(0), out.stride(0),
-        M_PAD=_m_pad(m), BLOCK_N=block_n, BLOCK_K=_block_k(k), OUT_FP16=out_dtype == torch.float16,
-        num_warps=4,
+        M_PAD=m_pad, BLOCK_N=block_n, BLOCK_K=block_k, OUT_FP16=out_dtype == torch.float16, num_warps=4,
     )
     return out
 
@@ -112,24 +133,11 @@ def _gate_up_swiglu_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     row_mask = rows < I
     ms = tl.arange(0, M_PAD)
-    ks = tl.arange(0, BLOCK_K)
-    acc_g = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
-    acc_u = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
-    for k0 in range(0, K, BLOCK_K):
-        wg = tl.load(w_ptr + rows[:, None] * K + (k0 + ks)[None, :], mask=row_mask[:, None], other=0.0)
-        wu = tl.load(w_ptr + (rows + I)[:, None] * K + (k0 + ks)[None, :], mask=row_mask[:, None], other=0.0)
-        wg = wg.to(tl.float32)
-        wu = wu.to(tl.float32)
-        for m in tl.static_range(M_PAD):
-            if m < M:
-                x = tl.load(x_ptr + m * stride_xm + k0 + ks).to(tl.float32)
-                sel = (ms == m)[:, None]
-                acc_g = tl.where(sel, acc_g + tl.sum(wg * x[None, :], axis=1)[None, :], acc_g)
-                acc_u = tl.where(sel, acc_u + tl.sum(wu * x[None, :], axis=1)[None, :], acc_u)
+    acc_g = _dot_rows(x_ptr, stride_xm, w_ptr, rows, row_mask, K, M, M_PAD, BLOCK_N, BLOCK_K)
+    acc_u = _dot_rows(x_ptr, stride_xm, w_ptr, rows + I, row_mask, K, M, M_PAD, BLOCK_N, BLOCK_K)
     # an unfused path stores both projections in FP16 before the activation; do the same rounding
     gate = tl.minimum(acc_g.to(tl.float16).to(tl.float32), limit)
     up = tl.minimum(tl.maximum(acc_u.to(tl.float16).to(tl.float32), -limit), limit)
@@ -148,10 +156,12 @@ def gate_up_swiglu(x: torch.Tensor, w13: torch.Tensor, limit: float) -> torch.Te
     out = torch.empty((m, inter), dtype=torch.float16, device=x.device)
     if m == 0:
         return out
-    block_n = 2
+    m_pad = _m_pad(m)
+    block_n, block_k = _config(2 * inter, k, m_pad)
+    block_n = max(1, block_n // 2)  # each program reads a gate row and its up row
     _gate_up_swiglu_kernel[(triton.cdiv(inter, block_n),)](
         x, w13, out, m, inter, k, float(limit), x.stride(0),
-        M_PAD=_m_pad(m), BLOCK_N=block_n, BLOCK_K=_block_k(k), num_warps=4,
+        M_PAD=m_pad, BLOCK_N=block_n, BLOCK_K=block_k, num_warps=4,
     )
     return out
 
@@ -171,19 +181,10 @@ def _down_combine_kernel(
     BLOCK_K: tl.constexpr,
     TOP_K: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rows = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     row_mask = rows < N
     ms = tl.arange(0, M_PAD)
-    ks = tl.arange(0, BLOCK_K)
-    acc = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
-    for k0 in range(0, K, BLOCK_K):
-        w = tl.load(w_ptr + rows[:, None] * K + (k0 + ks)[None, :], mask=row_mask[:, None], other=0.0)
-        w = w.to(tl.float32)
-        for m in tl.static_range(M_PAD):
-            if m < M:
-                a = tl.load(act_ptr + m * K + k0 + ks).to(tl.float32)
-                acc = tl.where((ms == m)[:, None], acc + tl.sum(w * a[None, :], axis=1)[None, :], acc)
+    acc = _dot_rows(act_ptr, K, w_ptr, rows, row_mask, K, M, M_PAD, BLOCK_N, BLOCK_K)
     mask = (ms < M)[:, None] & row_mask[None, :]
     if TOP_K > 0:
         routed = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
@@ -223,10 +224,11 @@ def down_combine(
     out = torch.empty((m, n), dtype=torch.float32, device=act.device)
     if m == 0:
         return out
-    block_n = 8
+    m_pad = _m_pad(m)
+    block_n, block_k = _config(n, k, m_pad)
     _down_combine_kernel[(triton.cdiv(n, block_n),)](
         act, w2, y_slots if y_slots is not None else act, topk_weights if topk_weights is not None else act,
-        out, m, n, k, M_PAD=_m_pad(m), BLOCK_N=block_n, BLOCK_K=_block_k(k), TOP_K=top_k,
+        out, m, n, k, M_PAD=m_pad, BLOCK_N=block_n, BLOCK_K=block_k, TOP_K=top_k,
         num_warps=4, enable_fp_fusion=False,
     )
     return out
