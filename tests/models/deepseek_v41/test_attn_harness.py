@@ -141,33 +141,41 @@ class SimKV:
         mine.blocks = theirs.blocks
         mine.free = theirs.free
 
-    def metadata(self, batch: list[tuple[str, int, int]]) -> tuple[dict, torch.Tensor]:
-        """batch = [(req_id, start_pos, num_tokens)] in runner order -> ({name: metadata}, positions [T])."""
+    def metadata(self, batch: list[tuple[str, int, int]], pad_tokens: int | None = None,
+                 pad_reqs: int | None = None) -> tuple[dict, torch.Tensor]:
+        """batch = [(req_id, start_pos, num_tokens)] in runner order -> ({name: metadata}, positions [T]).
+        ``pad_tokens`` / ``pad_reqs``: CUDA-graph padding as the runner does it (num_actual_tokens / num_reqs padded;
+        padded requests have no query tokens, seq_len 0 and null-block table rows; padded slots -1)."""
         for req, start, n in batch:
             self.ensure(req, start + n)
         qlens = [n for _, _, n in batch]
-        qsl = np.concatenate([[0], np.cumsum(qlens)]).astype(np.int32)
-        seq = np.asarray([s + n for _, s, n in batch], dtype=np.int32)
+        R = len(batch)
+        Rp = max(R, pad_reqs or R)
+        qsl = np.concatenate([[0], np.cumsum(qlens), np.full(Rp - R, sum(qlens))]).astype(np.int32)
+        seq = np.concatenate([np.asarray([s + n for _, s, n in batch]), np.zeros(Rp - R)]).astype(np.int32)
         pos = np.concatenate([np.arange(s, s + n) for _, s, n in batch]).astype(np.int64)
         T = int(qsl[-1])
+        Tp = max(T, pad_tokens or T)
+        pos_p = np.concatenate([pos, np.zeros(Tp - T, dtype=np.int64)])
         dev = self.device
         out = {}
         for name, c in self.caches.items():
             bs = c.spec.block_size
             width = max(len(c.blocks[r]) for r, _, _ in batch)
-            bt = np.zeros((len(batch), width), dtype=np.int32)
+            bt = np.zeros((Rp, width), dtype=np.int32)
             for i, (r, _, _) in enumerate(batch):
                 bt[i, : len(c.blocks[r])] = c.blocks[r]
-            req_of = np.repeat(np.arange(len(batch)), qlens)
-            slots = bt[req_of, pos // bs].astype(np.int64) * bs + pos % bs
+            req_of = np.repeat(np.arange(R), qlens)
+            slots = np.concatenate([bt[req_of, pos // bs].astype(np.int64) * bs + pos % bs,
+                                    np.full(Tp - T, -1, dtype=np.int64)])
             cm = CommonAttentionMetadata(
                 query_start_loc=torch.from_numpy(qsl).to(dev), query_start_loc_cpu=torch.from_numpy(qsl),
-                seq_lens=torch.from_numpy(seq).to(dev), num_reqs=len(batch), num_actual_tokens=T,
+                seq_lens=torch.from_numpy(seq).to(dev), num_reqs=Rp, num_actual_tokens=Tp,
                 max_query_len=max(qlens), max_seq_len=int(seq.max()),
                 block_table_tensor=torch.from_numpy(bt).to(dev), slot_mapping=torch.from_numpy(slots).to(dev),
-                positions=torch.from_numpy(pos).to(dev), seq_lens_cpu_upper_bound=torch.from_numpy(seq))
+                positions=torch.from_numpy(pos_p).to(dev), seq_lens_cpu_upper_bound=torch.from_numpy(seq))
             out[name] = self.builders[name].build(0, cm)
-        return out, torch.from_numpy(pos).to(dev)
+        return out, torch.from_numpy(pos_p).to(dev)
 
     def rows_at(self, name: str, req: str, positions: np.ndarray, ratio: int = 1) -> torch.Tensor:
         """Cache rows holding logical entries ``positions`` (token positions for SWA/state; compressed index for
