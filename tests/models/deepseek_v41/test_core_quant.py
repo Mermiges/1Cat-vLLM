@@ -96,7 +96,11 @@ def test_linear_dequant_fallback_and_forward(ds41_dist_single) -> None:
     torch.testing.assert_close(out.float(), x.float() @ expect.t(), rtol=2e-3, atol=2e-3)
 
 
-def test_bmm_layer_uses_grouped_einsum(ds41_dist_single) -> None:
+def test_bmm_layer_uses_grouped_einsum(
+    ds41_dist_single, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # This CPU fixture exercises the einsum fallback, not CUDA-only g32 packing.
+    monkeypatch.setenv("VLLM_DS41_MOE_DENSE_G32", "0")
     with set_current_vllm_config(_vllm_config()):
         cfg = _qconfig()
         layer = _linear(cfg, "model.layers.3.attn.wo_a", 2 * 64, 32)   # 2 groups of [64, 32]

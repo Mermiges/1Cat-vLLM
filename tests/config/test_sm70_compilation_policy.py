@@ -70,7 +70,7 @@ def policy_module():
         if isinstance(node, ast.Assign)
         and any(
             isinstance(target, ast.Name)
-            and target.id == "sm70_compile_disabled_by_user"
+            and target.id == "ds41_no_compile"
             for target in node.targets
         )
     ]
@@ -88,6 +88,7 @@ def policy_module():
     # assignments. Leave model loading and later compatibility checks outside.
     policy.body = post_init.body[starts[0] : ends[0] + 1]
     helper_names = {
+        "_disable_ds41_compile",
         "_is_sm70_dflash2_verifier_contract",
         "_is_sm70_qwen38_decode_compile_contract",
         "_apply_sm70_qwen38_decode_defaults",
