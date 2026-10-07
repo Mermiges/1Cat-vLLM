@@ -198,6 +198,19 @@ def test_refuses_overflowing_exponent():
         fp8_g32.prepare_fp8_g32(w, s_hi)
 
 
+@pytest.mark.parametrize("code", [0x7F, 0xFF])
+def test_refuses_nan_codes(code):
+    """E4M3fn NaN bytes would decode as +-480 on the g32 paths but NaN in the FP16 fallback: refuse them."""
+    w, s = _rand_fp8(64, 256, seed=7)
+    bad = w.view(torch.uint8).clone()
+    bad[5, 17] = code
+    assert torch.isnan(bad.view(torch.float8_e4m3fn).float()[5, 17])
+    with pytest.raises(ValueError, match="1 E4M3 NaN codes"):
+        fp8_g32.prepare_fp8_g32(bad.view(torch.float8_e4m3fn), s)
+    with pytest.raises(ValueError, match="NaN codes"):
+        fp8_g32.prepare_fp8_g32(bad, s)  # uint8 bytes, same check
+
+
 def test_group128_path_unchanged():
     """DeepSeek-V4 / generic 128 x 128 block FP8 keeps running through the same ops."""
     from vllm import _sm70_ops as sm70_ops

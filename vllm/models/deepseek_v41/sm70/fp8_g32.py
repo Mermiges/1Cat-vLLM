@@ -75,6 +75,10 @@ def prepare_fp8_g32(weight: torch.Tensor, scale: torch.Tensor) -> Fp8G32Weight:
     if weight.dtype != torch.float8_e4m3fn:
         raise TypeError(f"prepare_fp8_g32: weight dtype {weight.dtype} is not E4M3")
     n, k = weight.shape
+    nan_codes = int(((weight.view(torch.uint8) & 0x7F) == 0x7F).sum().item())
+    if nan_codes:
+        # E4M3fn 0x7F / 0xFF are NaN; the FP16 fallback propagates them, while the g32 decoders would read +-480
+        raise ValueError(f"prepare_fp8_g32: weight holds {nan_codes} E4M3 NaN codes (0x7F/0xFF); corrupt checkpoint?")
     if n % PANEL or k % GROUP:
         raise ValueError(f"prepare_fp8_g32: needs N % 32 == 0 and K % 32 == 0, got N={n} K={k}")
     s = _scale_fp32(scale.to(weight.device))
