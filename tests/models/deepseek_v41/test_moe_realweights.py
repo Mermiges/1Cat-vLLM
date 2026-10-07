@@ -18,6 +18,7 @@ pytest runs TP1 on one GPU; the CLI also runs TP4 across four GPUs (one process 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import socket
@@ -280,7 +281,9 @@ def run_rank(rank: int, world: int, port: int, args: argparse.Namespace) -> None
                 print(f"[{prefix} TP{world} T={num_tokens}] {json.dumps(per_t[str(num_tokens)])}", flush=True)
         if rank == 0:
             report["layers"][prefix] = {"load_s": load_s, "gate_weight_exp": block.gate.weight_exp, "T": per_t}
-        del block, oracle, spilled
+        # free everything of this layer before the next one (several TP1 layers with --oracle otherwise OOM)
+        del block, oracle, spilled, t, next_t, x_all, x16, logits, ids, out
+        gc.collect()
         torch.cuda.empty_cache()
     if rank == 0 and args.out:
         Path(args.out).mkdir(parents=True, exist_ok=True)
@@ -316,10 +319,10 @@ def main(argv: list[str] | None = None) -> None:
 @pytest.mark.sm70
 @pytest.mark.weights
 @pytest.mark.parametrize("layer", ["layers.3"])
-def test_real_weights_tp1(layer: str) -> None:
+def test_real_weights_tp1(layer: str, tmp_path: Path) -> None:
     if not (CKPT / shard_of(layer)).exists():
         pytest.skip(f"{shard_of(layer)} not downloaded")
-    out = Path("/mnt/nvme2/scratch/ds41/l-moe/ab")
+    out = tmp_path
     main(["--layers", layer, "--tp", "1", "--tokens", "1", "8", "512", "--out", str(out)])
     report = json.loads((out / f"ab_tp1_sm70_{os.environ.get('VLLM_DS41_MOE_BACKEND', 'skinny')}_{layer}.json")
                         .read_text())

@@ -15,10 +15,13 @@ Backends (``backend``):
 * ``torch``: per-expert loop over FP32-dequantised weights (the in-tree oracle, PORT_DESIGN §7.1). Same rounding
   points as the kernels: W13 output, activation and W2 output each rounded to FP16 once.
 
-Expert spill (Phase A, §5.2): experts of ``ExpertSpillPlan.spilled_expert_ids`` live in pinned host memory
-(``cudaHostAlloc``, exact size) and are read by the kernels in place through their UVA device view. Physical
-expert ids put the resident experts first; the resident and spilled partitions run one launch each over one
-shared routing permutation. The spilled weights are never allocated in HBM, not even during loading.
+Expert spill (Phase A, §5.2): experts of ``ExpertSpillPlan.spilled_expert_ids`` live in mapped pinned host memory
+and are read by the kernels in place through their UVA device view. ``create_weights`` builds each spilled tensor as
+a pageable zero tensor that ``get_accelerator_view_from_cpu_tensor`` copies into an exact-size ``cudaHostAlloc``
+(torch ``pin_memory`` would round to 2^k), so host RAM transiently holds two copies of one tensor (<= 342 MB at TP4);
+a failed ``cudaHostAlloc`` raises. Physical expert ids put the resident experts first; the resident and spilled
+partitions run one launch each over one shared routing permutation. The spilled weights are never allocated in HBM,
+not even during loading.
 """
 
 from __future__ import annotations

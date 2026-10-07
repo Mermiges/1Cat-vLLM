@@ -201,3 +201,13 @@ def test_expert_params_mapping_shape():
     assert len(mapping) == 3 * 384
     assert mapping[0] == ("experts.w13_", "experts.0.w1.", 0, "w1")
     assert ("experts.w2_", "experts.383.w2.", 383, "w2") in mapping
+
+
+def test_topk_check_refuses_graph_capture(moe_env, ckpt, monkeypatch):
+    """The debug TP checksum syncs the host: under capture it must refuse loudly, never silently skip."""
+    moe_env()
+    block = build_block(384, 6, ckpt)
+    _, ids = block.route(block.gate_logits(_x(2, 0)))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="CUDA-graph capture"):
+        block._check_topk_consistent(ids)

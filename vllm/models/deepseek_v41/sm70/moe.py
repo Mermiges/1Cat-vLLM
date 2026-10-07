@@ -20,7 +20,7 @@ gate-up GEMV, the combine fused into the down GEMV); larger T uses cuBLAS with F
 Knobs (``knobs.py`` helpers): ``VLLM_DS41_MOE_IMPL`` = sm70 | torch (per-expert FP32-dequantised oracle, §7.1);
 ``VLLM_DS41_MOE_BACKEND`` = skinny | turbomind; ``VLLM_DS41_MOE_DECODE_GEMV`` (default 1);
 ``VLLM_DS41_MOE_TOPK_CHECK`` (default 0: all-gathers a router-id checksum across TP each step and asserts
-equality, §4.1).
+equality, §4.1; debug only — it syncs the host, so it refuses to run under CUDA-graph capture: use enforce_eager).
 """
 
 from __future__ import annotations
@@ -243,6 +243,9 @@ class DeepseekV41MoE(nn.Module):
         return out
 
     def _check_topk_consistent(self, topk_ids: torch.Tensor) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"{TOPK_CHECK_KNOB}=1 syncs the host and cannot run under CUDA-graph capture; "
+                               "run the debug check with enforce_eager")
         pos = torch.arange(1, topk_ids.numel() + 1, device=topk_ids.device, dtype=torch.int64)
         checksum = (topk_ids.reshape(-1).to(torch.int64) * pos).sum().view(1)
         gathered = get_tp_group().all_gather(checksum, dim=0)
