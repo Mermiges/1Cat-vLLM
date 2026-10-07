@@ -326,3 +326,12 @@ def test_skip_special_tokens_disabled_for_tools(hf_tokenizer) -> None:
 
     request = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "x"}], tools=[READ_FILE])
     assert _tool_parser(hf_tokenizer, None).adjust_request(request).skip_special_tokens is False
+
+
+def test_renderer_registered_for_tokenizer_mode() -> None:
+    """L-INTEG: tokenizer_mode deepseek_v41 (also the auto default for the arch) needs a renderer, else LLMEngine
+    construction fails with "No renderer registered for renderer_mode='deepseek_v41'"."""
+    from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+    from vllm.renderers.registry import RENDERER_REGISTRY
+
+    assert RENDERER_REGISTRY.load_renderer_cls("deepseek_v41") is DeepseekV4Renderer

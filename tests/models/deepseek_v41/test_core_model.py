@@ -99,8 +99,15 @@ def _build(ckpt: Path, monkeypatch: pytest.MonkeyPatch, subset: str = "0,1,2,3")
     from vllm.models.deepseek_v41.sm70.model import DeepseekV41ForCausalLM
 
     vc = _vllm_config(ckpt)
-    with set_current_vllm_config(vc), set_default_torch_dtype(torch.float16):
-        model = DeepseekV41ForCausalLM(vllm_config=vc)
+    # vLLM's set_default_torch_dtype restores the dtype only on a clean exit (no try/finally): a constructor that
+    # raises (e.g. the open-subset rejection test) would leave float16 as the process default and break later
+    # tests' float32 tensors (L-INTEG: 21 test_moe_* reds in the combined suite). Restore it unconditionally.
+    prev_dtype = torch.get_default_dtype()
+    try:
+        with set_current_vllm_config(vc), set_default_torch_dtype(torch.float16):
+            model = DeepseekV41ForCausalLM(vllm_config=vc)
+    finally:
+        torch.set_default_dtype(prev_dtype)
     return model, vc
 
 
@@ -326,6 +333,21 @@ def test_engram_unconsumed_tensor_raises(loaded_model, monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="unconsumed"):
         model.load_weights([("layers.1.engram.wkv.weight", torch.zeros(1)),
                             ("layers.1.engram.q_weight", torch.zeros(1))])
+
+
+def test_engram_may_report_completed_params(ds41_dist_single, ds41_checkpoint_dir, monkeypatch) -> None:
+    """L-INTEG: the real L-ENGRAM module returns consumed checkpoint names PLUS the parameters it completed
+    ('wkv_r', 'qk'); L-CORE accepts the module's own parameter names but still raises on any other unknown name."""
+    for extra, ok in (({"wkv_r", "qk"}, True), ({"not_a_param"}, False)):
+        model, _ = _build(ds41_checkpoint_dir, monkeypatch)
+        engram = model.model.layers[1].engram
+        real = engram.load_weights
+        monkeypatch.setattr(engram, "load_weights", lambda items, real=real, extra=extra: set(real(items)) | extra)
+        if ok:
+            model.load_weights(_weights_for({0, 1, 2, 3}))
+        else:
+            with pytest.raises(RuntimeError, match="unknown"):
+                model.load_weights(_weights_for({0, 1, 2, 3}))
 
 
 def test_dummy_flag_reaches_engram(loaded_model) -> None:

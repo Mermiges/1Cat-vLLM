@@ -113,3 +113,23 @@ def test_breakable_cudagraph_architectures() -> None:
     archs = vllm_config_module.BREAKABLE_CUDAGRAPH_ARCHITECTURES
     assert {"DeepseekV4ForCausalLM", "DeepSeekV4MTPModel", "DeepseekV41ForCausalLM"} <= set(archs)
     assert "a in BREAKABLE_CUDAGRAPH_ARCHITECTURES" in inspect.getsource(vllm_config_module.VllmConfig)
+
+
+def test_cache_block_size_set_before_model_init() -> None:
+    """L-INTEG: the V4.1 attention builds its cache specs at model construction, before the platform's
+    update_block_size_for_backend; the model-config hook must set the V4.1 block size (default 16 is refused)."""
+    from types import SimpleNamespace
+
+    from vllm.config.cache import CacheConfig
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP, DeepseekV41ForCausalLMConfig
+    from vllm.models.deepseek_v41.sm70.sparse import PREFERRED_BLOCK_SIZE
+
+    assert MODELS_CONFIG_MAP["DeepseekV41ForCausalLM"] is DeepseekV41ForCausalLMConfig
+    assert DeepseekV41ForCausalLMConfig.PREFERRED_BLOCK_SIZE == PREFERRED_BLOCK_SIZE
+    vc = SimpleNamespace(cache_config=CacheConfig())
+    assert vc.cache_config.block_size == CacheConfig.DEFAULT_BLOCK_SIZE
+    DeepseekV41ForCausalLMConfig.verify_and_update_config(vc)
+    assert vc.cache_config.block_size == PREFERRED_BLOCK_SIZE
+    user = SimpleNamespace(cache_config=CacheConfig(block_size=128))
+    DeepseekV41ForCausalLMConfig.verify_and_update_config(user)
+    assert user.cache_config.block_size == 128

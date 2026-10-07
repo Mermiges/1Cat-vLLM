@@ -544,6 +544,9 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsPP):
             module = self._delegates[prefix]
             consumed = set(module.load_weights(items))
             given = {rel for rel, _ in items}
+            # the delegate may also report the parameters it completed (L-ENGRAM returns 'wkv_r', 'qk' for vLLM's
+            # every-parameter-loaded check); those are not checkpoint names. Anything else unknown still raises.
+            consumed -= {name for name, _ in module.named_parameters()} - given
             if consumed != given:
                 raise RuntimeError(f"{prefix}.load_weights consumed {sorted(consumed)} of {sorted(given)}; "
                                    f"unconsumed {sorted(given - consumed)}, unknown {sorted(consumed - given)}")
