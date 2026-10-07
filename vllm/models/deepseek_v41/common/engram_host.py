@@ -262,6 +262,18 @@ class EngramHostService:
     def __init__(self, hf_config, layers: tuple[int, ...], tp_rank: int, tp_size: int, row_dir: str,
                  tokenizer_path: str, max_num_batched_tokens: int, device: torch.device,
                  io_threads: int = 4) -> None:
+        try:
+            self._init(hf_config, layers, tp_rank, tp_size, row_dir, tokenizer_path, max_num_batched_tokens,
+                       device, io_threads)
+        except BaseException:
+            # a failing ctor must not leave scale tables cudaHostRegister'ed (or reader threads running): the
+            # mapping is freed by GC while still registered and a later registration of a recycled address fails
+            # (cudaErrorHostMemoryAlreadyRegistered). Re-raise unchanged.
+            self.shutdown()
+            raise
+
+    def _init(self, hf_config, layers: tuple[int, ...], tp_rank: int, tp_size: int, row_dir: str,
+              tokenizer_path: str, max_num_batched_tokens: int, device: torch.device, io_threads: int) -> None:
         t0 = time.perf_counter()
         self.layout = EngramLayout.from_hf_config(hf_config)
         if layout_bad := [lid for lid in layers if lid not in self.layout.layer_ids]:
@@ -331,8 +343,10 @@ class EngramHostService:
 
         # -- staging: 2 slots of unique rows (row 0 = all zeros = padding) + runner-order index maps
         self.max_unique = self.max_tokens * L * S + 1
-        self._host_rows = torch.zeros((N_SLOTS, self.max_unique, ENGRAM_ROW_BYTES), dtype=torch.uint8).pin_memory()
-        self._host_idx = torch.zeros((N_SLOTS, L * self.max_tokens * S), dtype=torch.int32).pin_memory()
+        # explicit CPU: vLLM constructs the model (and this service) under a `with torch.device("cuda")` context
+        self._host_rows = torch.zeros((N_SLOTS, self.max_unique, ENGRAM_ROW_BYTES), dtype=torch.uint8,
+                                      device="cpu").pin_memory()
+        self._host_idx = torch.zeros((N_SLOTS, L * self.max_tokens * S), dtype=torch.int32, device="cpu").pin_memory()
         self._dev_rows = torch.zeros((N_SLOTS, self.max_unique, ENGRAM_ROW_BYTES), dtype=torch.uint8,
                                      device=self.device)
         self._dev_idx = torch.zeros((N_SLOTS, L * self.max_tokens * S), dtype=torch.int32, device=self.device)

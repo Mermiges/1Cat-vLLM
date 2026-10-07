@@ -311,3 +311,30 @@ def test_io_threads_knob_overrides_ctor(syn: SyntheticEngram, monkeypatch: pytes
     monkeypatch.setenv("VLLM_DS41_ENGRAM_IO_THREADS", "0")
     with pytest.raises(ValueError, match="minimum"):
         make_service(syn)
+
+
+def test_service_builds_under_cuda_default_device(syn: SyntheticEngram) -> None:
+    """L-INTEG: vLLM's model loader constructs the model under `with torch.device("cuda")`; host staging must stay
+    pinned CPU memory (failed with "cannot pin 'torch.cuda.ByteTensor'" at the first engine bring-up)."""
+    with torch.device("cuda"):
+        svc = make_service(syn)
+    try:
+        assert svc._host_rows.device.type == "cpu" and svc._host_rows.is_pinned()
+        assert svc._host_idx.device.type == "cpu" and svc._host_idx.is_pinned()
+    finally:
+        svc.shutdown()
+
+
+def test_failed_ctor_releases_scale_registration(syn: SyntheticEngram, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L-INTEG: a ctor that raises after registering its scale tables (here: io_threads knob 0) must unregister them;
+    otherwise the next service fails with "cudaHostRegister ... failed" once the address is recycled."""
+    import gc
+
+    monkeypatch.setenv("VLLM_DS41_ENGRAM_IO_THREADS", "0")
+    for _ in range(3):
+        with pytest.raises(ValueError, match="minimum"):
+            make_service(syn)
+        gc.collect()
+    monkeypatch.delenv("VLLM_DS41_ENGRAM_IO_THREADS")
+    svc = make_service(syn)
+    svc.shutdown()
