@@ -80,6 +80,20 @@ BREAKABLE_CUDAGRAPH_ARCHITECTURES = (
     "DeepseekV41ForCausalLM",
 )
 
+
+def _disable_ds41_compile(
+    model_config: ModelConfig | None, compilation_config: CompilationConfig
+) -> bool:
+    """D16 precision policy, including explicit breakable-graph opt-outs."""
+    if model_config is None or (
+        "DeepseekV41ForCausalLM" not in model_config.architectures
+    ):
+        return False
+    logger.warning_once("DeepSeek-V4.1 disables torch.compile (D16).")
+    compilation_config.mode = CompilationMode.NONE
+    return True
+
+
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "Glm5NextForCausalLM",
@@ -1997,10 +2011,17 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
+        # D16: compiled V4.1 changed greedy output. This precision policy also
+        # applies when the user explicitly opts out of breakable graphs.
+        ds41_no_compile = _disable_ds41_compile(
+            self.model_config, self.compilation_config
+        )
+
         sm70_compile_disabled_by_user = (
             (self.model_config is not None and self.model_config.enforce_eager)
             or os.environ.get("TORCH_COMPILE_DISABLE") == "1"
             or envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            or ds41_no_compile
         )
         sm70_no_compile_decode_graph_requested = (
             envs.VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE

@@ -235,14 +235,17 @@ def test_runner_layout_sampling_rank_fills_tokens(monkeypatch) -> None:
 @pytest.mark.parametrize("mode, refused", [(CUDAGraphMode.FULL, True), (CUDAGraphMode.FULL_AND_PIECEWISE, True),
                                            (CUDAGraphMode.FULL_DECODE_ONLY, True), (CUDAGraphMode.PIECEWISE, False),
                                            (CUDAGraphMode.NONE, False)])
-def test_full_cudagraphs_refused_on_engram_stage(mode, refused) -> None:
+def test_full_cudagraphs_refused_on_engram_stage(mode, refused, monkeypatch) -> None:
     """MC-CORE F4 / AM-11c: FULL graph modes are refused when the stage owns Engram layers (after mode resolution)."""
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
 
     for service, expect in ((object(), refused), (None, False)):
         runner = GPUModelRunner.__new__(GPUModelRunner)
         runner._engram_bind_service_cache = service
         runner.compilation_config = SimpleNamespace(cudagraph_mode=mode)
+        runner.vllm_config = _vllm_config()
         if expect:
             with pytest.raises(ValueError, match="Engram"):
                 runner._refuse_full_cudagraphs_with_engram()
@@ -283,7 +286,9 @@ def _engram_worker(monkeypatch, log: list, forward):
     worker.annotate_profile = lambda so: contextlib.nullcontext()
     service = _RecordingEngram(log)
     worker._engram_service = lambda: service
-    worker._engram_planner = SimpleNamespace(plan=lambda so: SimpleNamespace(step_id=7))
+    worker._engram_planner = SimpleNamespace(
+        plan=lambda so: SimpleNamespace(step_id=7, reqs=())
+    )
 
     def execute_model(so, it):
         log.append(("forward", worker.model_runner._engram_step_id))

@@ -6546,20 +6546,24 @@ class GPUModelRunner(
         model = self.get_model() if hasattr(self, "model") else None
         service = getattr(model, "engram_service", None)
         if service is not None and self.use_async_scheduling:
-            raise NotImplementedError(
-                "DeepSeek-V4.1 Engram needs synchronous scheduling at P2 (PORT_DESIGN A9)"
-            )
+            from vllm.models.deepseek_v41.common.async_pp import require_async_pp
+
+            require_async_pp(self.vllm_config)
         self._engram_bind_service_cache = service
         return service
 
     def _refuse_full_cudagraphs_with_engram(self) -> None:
-        """PORT_DESIGN §9 AM-11c: a stage with Engram layers runs breakable graphs only.
+        """AM-11c / D21: Engram host waits must remain outside stream capture.
         Checked after the cudagraph mode is resolved (attention builders may have
         downgraded a requested FULL mode)."""
         if self._engram_bind_service() is None:
             return
         mode = self.compilation_config.cudagraph_mode
         if mode is not None and mode.has_full_cudagraphs():
+            from vllm.compilation.breakable_cudagraph import ds41_forced_eager_breaks
+
+            if ds41_forced_eager_breaks(self.vllm_config):
+                return
             raise ValueError(
                 f"cudagraph_mode={mode.name} captures FULL CUDA graphs, but this "
                 "DeepSeek-V4.1 stage owns Engram layers (host row gathers are eager "
@@ -6578,7 +6582,22 @@ class GPUModelRunner(
             )
         self._engram_step_id = None
         sampled_fill = None
-        if get_pp_group().world_size == 1:
+        if (
+            get_pp_group().world_size > 1
+            and getattr(self, "use_async_scheduling", False)
+        ):
+            if not hasattr(self, "_engram_unknown_req_ids"):
+                raise RuntimeError("Engram async PP is missing the worker's token plan")
+            required = self._engram_unknown_req_ids
+            received = getattr(self, "_engram_prev_sampled", None)
+            if required and received is None:
+                raise RuntimeError("Engram async PP decode has no sampled-id handoff")
+            if received is not None:
+                sampled_fill = received.for_batch(
+                    tuple(self.input_batch.req_ids[:num_reqs]), required
+                )
+            self._engram_prev_sampled = None
+        elif get_pp_group().world_size == 1:
             # The sampling rank owns Engram: under synchronous scheduling the token
             # at each request's first scheduled position is already in token_ids_cpu.
             rows = np.arange(num_reqs)
@@ -9892,6 +9911,16 @@ class GPUModelRunner(
                 )
             self.input_batch.prev_sampled_token_ids = recv
 
+        if self._engram_bind_service() is not None and self.use_async_scheduling:
+            from vllm.models.deepseek_v41.common.async_pp import SampledPPIds
+
+            self._engram_prev_sampled = None
+            if not self._is_all_reqs_chunked_prefill():
+                self._engram_prev_sampled = SampledPPIds.receive(
+                    self.input_batch.prev_sampled_token_ids,
+                    tuple(self.input_batch.req_ids[:num_reqs]),
+                )
+
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
         discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
@@ -12483,6 +12512,23 @@ class GPUModelRunner(
                 cg_support = builder_cls.get_cudagraph_support(
                     self.vllm_config, kv_cache_group.kv_cache_spec
                 )
+                # V4.1's entire attention op is an eager break. NEVER applies
+                # to monolithic capture, not the surrounding breakable graph.
+                if (
+                    cg_support == AttentionCGSupport.NEVER
+                    and is_breakable_cudagraph_enabled()
+                    and "DeepseekV41ForCausalLM" in self.model_config.architectures
+                    and attn_backend.__module__
+                    == "vllm.models.deepseek_v41.sm70.sparse"
+                ):
+                    if (
+                        self.compilation_config.cudagraph_mode
+                        != CUDAGraphMode.NONE
+                    ):
+                        self.compilation_config.cudagraph_mode = (
+                            CUDAGraphMode.PIECEWISE
+                        )
+                    cg_support = AttentionCGSupport.ALWAYS
                 if cg_support.value < min_cg_support.value:
                     min_cg_support = cg_support
                     min_cg_attn_backend = attn_backend.__name__
