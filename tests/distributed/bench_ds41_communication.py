@@ -16,10 +16,14 @@ import subprocess
 import time
 from datetime import timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 BOARD_B = (
     "GPU-0b2779f9-b525-ece6-857f-502d36299cfe",
@@ -49,7 +53,7 @@ def gpu_gate(world: int) -> None:
 
 
 def _pp(
-    rank: int, rows: int, mirrored: bool, grouped: str, pynccl: object
+    rank: int, rows: int, mirrored: bool, grouped: str, pynccl: PyNcclCommunicator
 ) -> dict[str, float]:
     schema = [((rows, 4, 5120), torch.bfloat16), ((rows, 4), torch.float32)]
     if mirrored:
@@ -123,7 +127,7 @@ def _ar(rank: int, world: int) -> list[dict[str, object]]:
         raise RuntimeError("custom AR disabled on allocated board")
     results = []
     try:
-        for rows in (1, 2, 4, 8):
+        for rows in range(1, 9):
             for width, dtype in (
                 (5120, torch.float16),
                 (5120, torch.float32),
@@ -134,7 +138,7 @@ def _ar(rank: int, world: int) -> list[dict[str, object]]:
                 )
                 y = torch.empty_like(x)
                 assert comm.should_custom_ar(x)
-                for limit in (None, 1, 2, 4, 8, 16):
+                for limit in (None, 1, 2, 4, 8, 16, 36):
                     if limit is None:
                         os.environ.pop("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT", None)
                     else:

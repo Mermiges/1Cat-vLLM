@@ -2273,6 +2273,26 @@ class CustomAllreduce {
         block_limit = 20;
       }
     }
+    if constexpr (std::is_same_v<T, float>) {
+      // Measured DS41 decode grids on one SM70 NVLink TP4 board. Preserve
+      // the pull kernel's rank-ordered arithmetic and explicit overrides.
+      const char* blocks_override =
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
+      if (world_size_ == 4 && fully_connected_ &&
+          block_limit == defaultBlockLimit &&
+          (blocks_override == nullptr || blocks_override[0] == '\0') &&
+          std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO") == nullptr &&
+          std::getenv("VLLM_SM70_TP4_M5_AR_THREADS") == nullptr &&
+          custom_allreduce_current_device_is_sm70()) {
+        if (bytes >= 100 * 1024 && bytes <= 800 * 1024 &&
+            bytes % (100 * 1024) == 0) {
+          block_limit = bytes <= 400 * 1024 ? 4 : 8;
+        } else if (bytes >= 60 * 1024 && bytes <= 160 * 1024 &&
+                   bytes % (20 * 1024) == 0) {
+          block_limit = 4;
+        }
+      }
+    }
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
     if constexpr (std::is_same_v<T, half>) {

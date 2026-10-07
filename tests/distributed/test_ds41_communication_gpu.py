@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 from datetime import timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -15,14 +16,53 @@ from safetensors.torch import load_file
 
 from .bench_ds41_communication import gpu_gate
 
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+
 GOLDEN = Path("/mnt/nvme2/scratch/ds41/golden")
 
 
 def _bits_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    if not torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)):
+        mismatch = actual.view(torch.uint8) != expected.view(torch.uint8)
+        raise AssertionError(
+            f"shape={tuple(actual.shape)} dtype={actual.dtype} "
+            f"byte mismatches={int(mismatch.sum())}; "
+            f"actual={actual.flatten()[:8].tolist()} "
+            f"expected={expected.flatten()[:8].tolist()}"
+        )
 
 
-def _reduce_gate(comm, rank: int, world: int) -> None:
+def _ordered_reference(inputs: list[torch.Tensor]) -> torch.Tensor:
+    """Default AR arithmetic: canonical below 512 KiB, rotated above.
+
+    TP4 two-stage reduce-scatter owns contiguous quarters of packed elements.
+    Quarter q sums ranks q,q+1,q+2,q+3 modulo four before the gather. This
+    long-standing ordering is independent of the tuned grid and differs from
+    NCCL and the small-payload rank-0-first order on cancellation inputs.
+    """
+    world = len(inputs)
+    x = inputs[0]
+    two_stage = world == 4 and x.numel() * x.element_size() >= 512 * 1024
+    if not two_stage:
+        expected = inputs[0].float()
+        for value in inputs[1:]:
+            expected = expected + value.float()
+        return expected.to(x.dtype)
+    expected = torch.empty_like(x)
+    flat = [value.flatten() for value in inputs]
+    part = (x.numel() // (16 // x.element_size()) // world) * (16 // x.element_size())
+    for owner in range(world):
+        start = owner * part
+        end = x.numel() if owner == world - 1 else start + part
+        total = flat[owner][start:end].float()
+        for offset in range(1, world):
+            total = total + flat[(owner + offset) % world][start:end].float()
+        expected.flatten()[start:end] = total.to(x.dtype)
+    return expected
+
+
+def _reduce_gate(comm: CustomAllreduce, rank: int, world: int) -> None:
     nccl_mismatches = 0
     for rows in range(1, 9):
         for width, dtype in (
@@ -54,16 +94,18 @@ def _reduce_gate(comm, rank: int, world: int) -> None:
                         val.zero_()
                         val[::2].fill_(-0.0)
                     inputs.append(val)
-                expected = inputs[0].float()
-                for val in inputs[1:]:
-                    expected = expected + val.float()
-                expected = expected.to(dtype)
+                expected = _ordered_reference(inputs)
                 x.copy_(inputs[rank])
                 dist.barrier()
                 if rank == cycle % world:
                     torch.cuda._sleep(10000)
                 graph.replay()
                 torch.cuda.synchronize()
+                print(
+                    f"checking rank={rank} rows={rows} width={width} "
+                    f"dtype={dtype} cycle={cycle}",
+                    flush=True,
+                )
                 _bits_equal(y, expected)
                 _bits_equal(comm.all_reduce(x), expected)
                 assert bool(torch.all(storage[:8] == 123))
@@ -75,12 +117,13 @@ def _reduce_gate(comm, rank: int, world: int) -> None:
                 )
             del graph
     print(
-        f"rank={rank} rank-ordered FP32 sum; NCCL byte mismatches={nccl_mismatches}",
+        f"rank={rank} documented FP32 accumulation order; "
+        f"NCCL byte mismatches={nccl_mismatches}",
         flush=True,
     )
 
 
-def _layer_goldens(comm, rank: int, world: int) -> None:
+def _layer_goldens(comm: CustomAllreduce, rank: int, world: int) -> None:
     files = sorted(GOLDEN.glob("*__v100-semantic+ownk__decode*/L*.safetensors"))
     if not files:
         raise RuntimeError("mandatory per-layer decode goldens missing")
@@ -129,7 +172,7 @@ def _layer_goldens(comm, rank: int, world: int) -> None:
     )
 
 
-def _pp_gate(rank: int, world: int, gloo) -> None:
+def _pp_gate(rank: int, world: int, gloo: dist.ProcessGroup) -> None:
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.static_cuda_transfer import enqueue_static_cuda_transfer
 
@@ -200,7 +243,8 @@ def _worker(rank: int, world: int, rendezvous: str, mode: str) -> None:
             assert not comm.disabled
             try:
                 _reduce_gate(comm, rank, world)
-                _layer_goldens(comm, rank, world)
+                if mode != "ar_order":
+                    _layer_goldens(comm, rank, world)
             finally:
                 comm.close()
     finally:
@@ -221,3 +265,29 @@ def test_ds41_static_pp_stream_order_and_first_use_chain(tmp_path: Path) -> None
     mp.spawn(
         _worker, args=(world, (tmp_path / "pp").as_uri(), "pp"), nprocs=world, join=True
     )
+
+
+def test_ds41_all_reduce_rank_order(tmp_path: Path) -> None:
+    world = int(os.environ.get("DS41_COMM_WORLD", "2"))
+    gpu_gate(world)
+    mp.spawn(
+        _worker,
+        args=(world, (tmp_path / "order").as_uri(), "ar_order"),
+        nprocs=world,
+        join=True,
+    )
+
+
+def test_ds41_reference_documents_two_stage_cancellation_order() -> None:
+    # Above the default 512-KiB boundary, quarter 2 starts at rank 2 and
+    # retains the small residual that rank-0-first addition rounds away.
+    shape = (6, 25600)
+    inputs = [
+        torch.full(shape, value, dtype=torch.float32)
+        for value in (65504.0, 0.0001, -65504.0, 0.03125)
+    ]
+    actual = _ordered_reference(inputs)
+    expected = torch.tensor([0.03125, 0.03125, 0.03135, 0.03125]).repeat_interleave(
+        actual.numel() // 4
+    )
+    _bits_equal(actual.flatten(), expected)
