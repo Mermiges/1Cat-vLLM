@@ -2588,6 +2588,11 @@ def _get_kv_cache_groups_uniform_groups(
     # Additionally, we also pad KV blocks in each SWA layer, to align the page size
     # with the corresponding layer in the full-MLA group.
     all_page_sizes = full_mla_spec.get_page_sizes()
+    v41_unpadded = all(
+        getattr(spec, "model_version", None) == "deepseek_v41"
+        for group in grouped_specs
+        for spec in group.kv_cache_specs.values()
+    )
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
@@ -2598,7 +2603,13 @@ def _get_kv_cache_groups_uniform_groups(
         # Compute candidate (nearest larger page_size) for each unique page size.
         size_to_candidate: dict[int, int] = {}
         for ps in sm_page_sizes:
-            size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
+            # V4.1's tensor planner supports the union of page sizes. Local
+            # graph profiling on stage 3 has only ratio-1 MLA pages, so padding
+            # its SWA to the next MLA size would break flat-row addressing.
+            # Reserve unmatched SWA pages separately, as in global allocation.
+            size_to_candidate[ps] = (
+                ps if v41_unpadded else min(x for x in all_page_sizes if x >= ps)
+            )
         # Pad and collect layer names per page size.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes
