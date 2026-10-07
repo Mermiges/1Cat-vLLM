@@ -281,3 +281,61 @@ def test_impl_knob(monkeypatch: pytest.MonkeyPatch) -> None:
         qat.default_impl()
     with pytest.raises(ValueError):
         qat.fp8_block32_qdq(torch.ones(2, 32), impl="triton")
+
+
+# ----------------------------------------------------------------------------- vs L-REF twins (§4.2)
+LREF_QAT = "/mnt/hdd/v100-research/tools/ds41_ref/ref_qat.py"
+
+
+def _lref_qat():
+    """L-REF's ref_qat.py loaded read-only by path (no sys.path change; it imports only torch)."""
+    import importlib.util
+    import os
+    import sys
+
+    if not os.path.exists(LREF_QAT):
+        pytest.skip(f"L-REF twins not present at {LREF_QAT}")
+    spec = importlib.util.spec_from_file_location("ds41_lref_ref_qat", LREF_QAT)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    prev, sys.dont_write_bytecode = sys.dont_write_bytecode, True     # strictly read-only on L-REF's tree
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = prev
+    return mod
+
+
+def _lref_inputs(it: int, rows: int, width: int, gen: torch.Generator) -> torch.Tensor:
+    dev = "cuda"
+    if it % 3 == 0:     # log-uniform magnitudes with a per-row exponent spread (block amax over many exponents)
+        mag = torch.exp2(torch.empty(rows, width, device=dev).uniform_(-12, 4, generator=gen))
+        x = mag * torch.exp2(torch.randint(-30, 20, (rows, 1), device=dev, generator=gen).float())
+        x[torch.rand(rows, width, device=dev, generator=gen) < 0.05] = 0.0
+    elif it % 3 == 1:   # exact E2M1 / E4M3 grid points and midpoints times powers of two
+        g = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.5, 6.0, 1.0625, 1.1875], device=dev)
+        x = g[torch.randint(0, len(g), (rows, width), device=dev, generator=gen)]
+        x = x * torch.exp2(torch.randint(-20, 10, (rows, 1), device=dev, generator=gen).float())
+    else:               # every-bit-pattern FP16 inputs (what the model feeds), non-finite zeroed
+        x = torch.randint(-32768, 32767, (rows, width), device=dev, dtype=torch.int16, generator=gen)
+        x = x.view(torch.float16)
+        x = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    sign = torch.where(torch.rand(rows, width, device=x.device, generator=gen) < 0.5, -1.0, 1.0)
+    return (x.float() * sign).contiguous()
+
+
+@pytest.mark.parametrize("kind", ["fp8_block32", "fp4_e8m0", "fp4_e4m3"])
+def test_bitwise_vs_lref_twins(kind: str) -> None:
+    """PORT_DESIGN §4.2 / §4.5 row 1: port Triton and torch twins == L-REF ref_qat bit for bit (sign of zero
+    included), on 12 x 1024 x 512 values per kind."""
+    ref = getattr(_lref_qat(), f"{kind}_qdq")
+    port = getattr(qat, f"{kind}_qdq")
+    gen = torch.Generator(device="cuda").manual_seed(4321)
+    n = mism_triton = mism_torch = 0
+    for it in range(12):
+        x = _lref_inputs(it, 1024, 512, gen)
+        want = ref(x).contiguous().view(torch.int32)
+        mism_triton += int((port(x, out_dtype=torch.float32, impl="triton").view(torch.int32) != want).sum())
+        mism_torch += int((port(x, out_dtype=torch.float32, impl="torch").view(torch.int32) != want).sum())
+        n += x.numel()
+    assert (mism_triton, mism_torch) == (0, 0), f"{kind}: {mism_triton}/{mism_torch} of {n} values differ"
