@@ -64,6 +64,7 @@ from vllm.models.deepseek_v41.compressor import (
     mm_fp32,
 )
 from vllm.models.deepseek_v41.indexer import DeepseekV41Indexer, attn_impl
+from vllm.models.deepseek_v41.quant_config import v41_grouped_linear, v41_linear
 from vllm.models.deepseek_v41.sm70.q_rope_kv_insert import q_rope_kv_insert
 from vllm.models.deepseek_v41.sm70.sparse import (
     DeepseekV41SM70SparseImpl,
@@ -178,10 +179,9 @@ class DeepseekV41Attention(nn.Module):
             from vllm.models.deepseek_v4.sm70.projection import sm70_inverse_rope
             o = sm70_inverse_rope(o.contiguous(), positions[:T], cos_sin, ROPE_DIM)
         g, d_in = self.n_local_groups, N_HEADS * HEAD_DIM // O_GROUPS
-        wo_a = _fp16_weight(self.wo_a, (g * O_LORA, d_in), f"{self.prefix}.wo_a").view(g, O_LORA, d_in)
-        og = o.reshape(T, g, d_in).transpose(0, 1)                                   # [g, T, 4096]
-        z = torch.bmm(og, wo_a.transpose(1, 2), out_dtype=torch.float32)            # [g, T, 1024]
-        z = z.transpose(0, 1).reshape(T, g * O_LORA).to(torch.float16)
+        # grouped wo_a [T, g*4096] -> [T, g*1024]: FP32 accumulate, one FP16 rounding (P5-MOE seam: FP16 fallback
+        # weight -> the P2 bmm; group-32 FP8 weight -> one grouped GEMV at decode)
+        z = v41_grouped_linear(self.wo_a, o.reshape(T, g * d_in), g, torch.float16)
         wo_b = _fp16_weight(self.wo_b, (HIDDEN, g * O_LORA), f"{self.prefix}.wo_b")
         out = mm_fp32(z, wo_b)
         if self.tp_size > 1:
@@ -190,20 +190,18 @@ class DeepseekV41Attention(nn.Module):
 
     def attention_impl(self, x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor) -> None:
         md_all = step_metadata(self.layer_name)
-        w_qkv = _fp16_weight(self.fused_wqa_wkv, (Q_LORA + HEAD_DIM, HIDDEN), f"{self.prefix}.fused_wqa_wkv")
-        w_qb = _fp16_weight(self.wq_b, (self.n_local_heads * HEAD_DIM, Q_LORA), f"{self.prefix}.wq_b")
         if md_all is None:              # dummy/profile forward without metadata (ForwardContext.is_dummy_run)
-            self._profile_run(x, positions, out, w_qkv, w_qb)
+            self._profile_run(x, positions, out)
             return
         swa_md = cast(DS41SWAMetadata, md_all[self.swa_cache.layer_name])
         T = swa_md.num_actual_tokens
         impl = attn_impl()
         pos = positions[:T]
-        qr_kv = mm_fp32(x[:T], w_qkv)
+        qr_kv = v41_linear(self.fused_wqa_wkv, x[:T], torch.float32)
         qr32 = self.q_norm(qr_kv[:, :Q_LORA])           # FP32; the indexer's q GEMM consumes it un-rounded
         qr = qr32.to(torch.float16)
         kv = self.kv_norm(qr_kv[:, Q_LORA:])
-        q = torch.mm(qr, w_qb.t()).view(T, self.n_local_heads, HEAD_DIM)
+        q = v41_linear(self.wq_b, qr, torch.float16).view(T, self.n_local_heads, HEAD_DIM)
         q_rope_kv_insert(q, kv, pos, self.rotary_emb.cos_sin_cache, self.swa_cache.rows(),
                          swa_md.slot_mapping, impl=impl)
 
@@ -232,12 +230,11 @@ class DeepseekV41Attention(nn.Module):
         if out.shape[0] > T:
             out[T:].zero_()
 
-    def _profile_run(self, x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor,
-                     w_qkv: torch.Tensor, w_qb: torch.Tensor) -> None:
+    def _profile_run(self, x: torch.Tensor, positions: torch.Tensor, out: torch.Tensor) -> None:
         """Dummy/profile forward: run the projections at full size and reserve the attention workspace."""
-        qr_kv = mm_fp32(x, w_qkv)
+        qr_kv = v41_linear(self.fused_wqa_wkv, x, torch.float32)
         qr = self.q_norm(qr_kv[:, :Q_LORA]).to(torch.float16)
-        torch.mm(qr, w_qb.t())
+        v41_linear(self.wq_b, qr, torch.float16)
         if self.compressor is not None:
             self.compressor(x, positions)
         if self.indexer is not None:

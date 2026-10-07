@@ -182,6 +182,13 @@ class DeepseekV41Indexer(nn.Module):
         keys_all = self._key_rows()
         qsl = md.query_start_loc_cpu
         pos_cpu = md.positions_cpu
+        t_real = int(qsl[md.num_reqs])
+        if t_real < T:
+            # CUDA-graph padding tokens (no request): no picks, no candidate mask -- never stale rows
+            topk_out[t_real:] = -1
+            if self.topo.is_candidate_source:
+                cand_out[t_real:] = -1
+                cand_out[t_real:, 0] = CAND_ALL
         for r in range(md.num_reqs):
             t0, t1 = int(qsl[r]), int(qsl[r + 1])
             if t1 <= t0:

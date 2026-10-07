@@ -49,6 +49,12 @@ from vllm.models.deepseek_v41.common.contracts import (
     SWA_RECORD_DIM,
     WINDOW,
 )
+from vllm.models.deepseek_v41.sm70.decode_metadata import (
+    KIND_COMPRESSED,
+    KIND_STATE,
+    KIND_SWA,
+    DecodeBuffers,
+)
 from vllm.models.deepseek_v41.sm70.sparse_kernels import (
     logical_to_rows,
     sparse_attention,
@@ -141,6 +147,10 @@ class DS41BatchMetadata:
     block_table: torch.Tensor              # [R, max_blocks] int32: physical block ids of this group
     block_size: int                        # tokens per block of this group
     slot_mapping: torch.Tensor             # [T] int64: row written by token t in this cache, -1 = none
+    # decode batch (every real request schedules one token, num_reqs == num_actual_tokens incl. CUDA-graph
+    # padding): every tensor above and below is a view of a builder-owned buffer with a fixed address, token t
+    # belongs to request t, and the layers take their static-shape decode path (no host data, no syncs).
+    decode: bool = False
 
 
 @dataclass
@@ -187,6 +197,17 @@ def step_metadata(site: str) -> dict[str, object] | None:
     raise TypeError(f"{site}: unexpected attn_metadata type {type(md).__name__}")
 
 
+DECODE_PATH_ENV = "VLLM_DS41_ATTN_DECODE_PATH"
+
+
+def decode_path_enabled() -> bool:
+    """Decode batches get builder-owned, graph-safe metadata (``decode=True``). OFF by default until the layers'
+    static-shape decode path consumes it (the general-path layers cannot); the torch oracle impl never uses it."""
+    if knobs.env_str("VLLM_DS41_ATTN_IMPL", "sm70", choices=("sm70", "torch")) == "torch":
+        return False
+    return knobs.env_bool(DECODE_PATH_ENV, False)
+
+
 def _exact_seq_lens_cpu(cm: CommonAttentionMetadata) -> np.ndarray:
     seq = cm.seq_lens_cpu_upper_bound
     if seq is None:
@@ -209,16 +230,70 @@ def _require_exact_host_lengths(vllm_config: VllmConfig) -> None:
 
 
 class _DS41BuilderBase(AttentionMetadataBuilder):
+    # P5-ATTN: uniform single-token decode batches get builder-owned, fixed-address metadata (decode=True) and the
+    # layers' static-shape decode path, which FULL CUDA graphs capture; prefill / mixed batches keep the general
+    # (host-dependent) path, which runs eagerly (breakable graphs: an eager break; PIECEWISE runtime mode).
+    # Until the layers' decode path lands (P5-ATTN handoff) the decode metadata is OFF by default
+    # (VLLM_DS41_ATTN_DECODE_PATH=0): the builders then declare NEVER and emit general metadata only.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
-    # V4.1 attention is an eager break whose control flow depends on host metadata (number of
-    # compressed latents, workspace tiles): it must not be captured inside FULL cudagraphs (P5 item).
     uses_physical_block_table: ClassVar[bool] = True
+    DECODE_KIND: ClassVar[int] = KIND_SWA
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec) -> AttentionCGSupport:
+        if decode_path_enabled():
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        return AttentionCGSupport.NEVER
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str], vllm_config: VllmConfig,
                  device: torch.device) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         _require_exact_host_lengths(vllm_config)
         self._init_reorder_batch_threshold(1)
+        self._decode_buffers: DecodeBuffers | None = None
+
+    def _decode_bufs(self) -> DecodeBuffers:
+        if self._decode_buffers is None:
+            cap = max(1, int(self.vllm_config.scheduler_config.max_num_seqs))
+            bs = int(self.kv_cache_spec.block_size)
+            max_len = int(self.vllm_config.model_config.max_model_len)
+            self._decode_buffers = DecodeBuffers(self.DECODE_KIND, cap, (max_len + bs - 1) // bs + 1, self.device)
+        return self._decode_buffers
+
+    @staticmethod
+    def decode_batch(cm: CommonAttentionMetadata) -> int | None:
+        """Number of real tokens if ``cm`` is a decode batch (every real request has one query token, padded
+        requests none, and num_reqs == num_actual_tokens), else None."""
+        if not decode_path_enabled():
+            return None
+        T, R = int(cm.num_actual_tokens), int(cm.num_reqs)
+        if R != T or T == 0 or int(cm.max_query_len) > 1:
+            return None
+        qsl = np.asarray(cm.query_start_loc_cpu[: R + 1].numpy(), dtype=np.int64)
+        t_real = int(qsl[-1])
+        qlen = np.diff(qsl)
+        if t_real > T or (qlen[:t_real] != 1).any() or (qlen[t_real:] != 0).any():
+            return None
+        return t_real
+
+    def _decode_common(self, cm: CommonAttentionMetadata, t_real: int, storage: int, ratio: int
+                       ) -> tuple[dict, DecodeBuffers]:
+        """Fill the builder-owned buffers on the device and return the base fields (views of them)."""
+        self._check_block_geometry()
+        T = int(cm.num_actual_tokens)
+        bufs = self._decode_bufs()
+        bufs.fill(T, t_real, cm.seq_lens, cm.slot_mapping, cm.block_table_tensor, int(self.kv_cache_spec.block_size),
+                  storage, ratio)
+        seq_cpu = _exact_seq_lens_cpu(cm)[:T]
+        real = (np.arange(T) < t_real) & (seq_cpu > 0)
+        pos_cpu = np.where(real, seq_cpu - 1, 0).astype(np.int64)
+        c = dict(
+            num_reqs=T, num_actual_tokens=T, query_start_loc=bufs.query_start_loc[: T + 1],
+            query_start_loc_cpu=np.arange(T + 1, dtype=np.int64).clip(max=t_real), seq_lens_cpu=seq_cpu,
+            token_to_req_indices=bufs.tok2req[:T], positions=bufs.positions[:T], positions_cpu=pos_cpu,
+            block_table=bufs.block_table[:T], block_size=int(self.kv_cache_spec.block_size),
+            slot_mapping=bufs.slot_mapping[:T], decode=True)
+        return c, bufs
 
     def _check_block_geometry(self) -> None:
         kbs = getattr(self, "kernel_block_size", None)
@@ -238,9 +313,12 @@ class _DS41BuilderBase(AttentionMetadataBuilder):
         if (starts < 0).any():
             raise RuntimeError(f"inconsistent batch: seq_lens {seq_cpu} shorter than query lens {qlen}")
         pos_cpu = np.repeat(starts - qsl_cpu[:-1], qlen) + np.arange(int(qsl_cpu[-1]), dtype=np.int64)
-        if pos_cpu.shape[0] != T:
+        if pos_cpu.shape[0] > T:
             raise RuntimeError(f"token count mismatch: query_start_loc covers {pos_cpu.shape[0]} tokens, "
                                f"num_actual_tokens={T}")
+        if pos_cpu.shape[0] < T:
+            # CUDA-graph padding tokens (no request; runner slot -1): position 0, nothing read or written
+            pos_cpu = np.concatenate([pos_cpu, np.zeros(T - pos_cpu.shape[0], dtype=np.int64)])
         tok2req = cm.token_to_req_indices(self._tok2req_buf)[:T]
         positions = torch.from_numpy(pos_cpu).to(self.device, non_blocking=True)
         return dict(
@@ -269,8 +347,15 @@ def rows_of_positions(block_table: torch.Tensor, tok2req: torch.Tensor, pos: tor
 
 
 class DS41SWAMetadataBuilder(_DS41BuilderBase):
+    DECODE_KIND = KIND_SWA
+
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> DS41SWAMetadata:
+        t_real = self.decode_batch(common_attn_metadata)
+        if t_real is not None:
+            c, bufs = self._decode_common(common_attn_metadata, t_real, int(self.kv_cache_spec.block_size), 1)
+            assert bufs.window_slots is not None
+            return DS41SWAMetadata(**c, window_slots=bufs.window_slots[: c["num_actual_tokens"]])
         c = self._common(common_attn_metadata)
         T = c["num_actual_tokens"]
         pos = c["positions"][:, None] - (WINDOW - 1) + torch.arange(WINDOW, device=self.device)[None, :]
@@ -282,12 +367,25 @@ class DS41SWAMetadataBuilder(_DS41BuilderBase):
 
 
 class DS41CompressedMetadataBuilder(_DS41BuilderBase):
+    DECODE_KIND = KIND_COMPRESSED
+
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> DS41CompressedMetadata:
-        c = self._common(common_attn_metadata)
         spec = self.kv_cache_spec
         r = int(spec.compress_ratio)
         storage = int(spec.storage_block_size)
+        t_real = self.decode_batch(common_attn_metadata)
+        if t_real is not None:
+            # every token is a latent slot candidate: latent n of the step = token n; non-completing tokens carry
+            # latent slot -1 (computed, never stored) -- the static-shape analogue of num_latents
+            c, bufs = self._decode_common(common_attn_metadata, t_real, storage, r)
+            T = c["num_actual_tokens"]
+            pos_cpu = c["positions_cpu"]
+            return DS41CompressedMetadata(
+                **c, compress_ratio=r, storage_block_size=storage, num_latents=T, latent_token_idx=bufs.token_idx[:T],
+                latent_pos=bufs.aux2[:T], latent_slots=bufs.aux[:T], num_visible=bufs.aux3[:T],
+                max_visible=int(((pos_cpu + 1) // r).max()) if T else 0)
+        c = self._common(common_attn_metadata)
         T = c["num_actual_tokens"]
         cm = common_attn_metadata
         slots = get_compressed_slot_mapping(
@@ -308,8 +406,14 @@ class DS41CompressedMetadataBuilder(_DS41BuilderBase):
 
 
 class DS41StateMetadataBuilder(_DS41BuilderBase):
+    DECODE_KIND = KIND_STATE
+
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> DS41StateMetadata:
+        t_real = self.decode_batch(common_attn_metadata)
+        if t_real is not None:
+            c, bufs = self._decode_common(common_attn_metadata, t_real, int(self.kv_cache_spec.block_size), 2)
+            return DS41StateMetadata(**c, prev_slot=bufs.aux[: c["num_actual_tokens"]])
         c = self._common(common_attn_metadata)
         p = c["positions"]
         completes = ((p + 1) % 2 == 0) & (c["slot_mapping"] >= 0)
