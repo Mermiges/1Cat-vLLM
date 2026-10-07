@@ -127,6 +127,20 @@ class SimKV:
         for c in self.caches.values():
             c.blocks.pop(req, None)
 
+    def release(self, req: str) -> None:
+        """Preemption: return the request's blocks to the free list and poison them with NaN."""
+        for c in self.caches.values():
+            for b in c.blocks.pop(req, []):
+                c.tensor[b].fill_(float("nan"))
+                c.free.append(b)
+
+    def link(self, name: str, other: "SimKV") -> None:
+        """Make ``name`` use the same block ids as ``other`` (one scheduler-side KV manager across PP stages)."""
+        mine, theirs = self.caches[name], other.caches[name]
+        assert mine.spec == theirs.spec, f"{name}: specs differ across stages"
+        mine.blocks = theirs.blocks
+        mine.free = theirs.free
+
     def metadata(self, batch: list[tuple[str, int, int]]) -> tuple[dict, torch.Tensor]:
         """batch = [(req_id, start_pos, num_tokens)] in runner order -> ({name: metadata}, positions [T])."""
         for req, start, n in batch:
