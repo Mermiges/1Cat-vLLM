@@ -958,8 +958,17 @@ class SpeculativeConfig:
 
                 if self.use_dspark():
                     draft_hf_config = self.draft_model_config.hf_config
-                    draft_hf_config.model_type = "deepseek_v4"
-                    draft_hf_config.architectures = ["DSparkDraftModel"]
+                    if draft_hf_config.model_type == "deepseek_v41":
+                        if self.num_speculative_tokens != 5:
+                            raise ValueError(
+                                "V4.1 DSpark requires num_speculative_tokens=5; "
+                                "use dspark_max_verification_tokens=1..5 to "
+                                "limit the verified prefix."
+                            )
+                        draft_hf_config.architectures = ["DSparkV41DraftModel"]
+                    else:
+                        draft_hf_config.model_type = "deepseek_v4"
+                        draft_hf_config.architectures = ["DSparkDraftModel"]
                     self.update_arch_()
 
                 if self.use_dflash_family() or self.use_dspark():
